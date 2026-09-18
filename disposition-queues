@@ -1,18 +1,27 @@
+
 -- Divert queue. Pre-discharge, deadline = vessel ETA - 72h. Save band = late by rail, on time by truck.
 CREATE OR ALTER VIEW dbo.v_DivertQueue AS
 WITH lines AS (
     SELECT
-        s.Container_Number,
-        s.VesselName,
-        s.FirstUSPort,
-        s.current_vessel_eta,
-        DATEADD(hour, -72, s.current_vessel_eta)                                  AS divert_deadline,
-        DATEADD(day, 3 + CASE WHEN s.FirstUSPort LIKE 'New York%' THEN 10 ELSE 9 END + 1,
-                s.current_vessel_eta)                                             AS rail_eta,
-        DATEADD(day, 4, s.current_vessel_eta)                                     AS truck_eta,
-        s.ORDR_DocNum, s.RDR1_LineNum, s.CardName, s.U_AssignedTo, s.SO_Line_Qty,
-        s.Line_Quoted_Delivery, s.U_Event, s.U_EventDt
-    FROM   TCWorking.dbo.v_ScoredOrderLine s
+    s.Container_Number,
+    s.VesselName,
+    s.FirstUSPort,
+    s.current_vessel_eta,
+    DATEADD(hour, -72, s.current_vessel_eta) AS divert_deadline,
+    DATEADD(day, 3 + CASE WHEN s.FirstUSPort LIKE 'New York%' THEN 10 ELSE 9 END + 1,
+            s.current_vessel_eta) AS rail_eta,
+    DATEADD(day, 4, s.current_vessel_eta) AS truck_eta,
+    s.ORDR_DocNum,
+    s.RDR1_LineNum,
+    s.CardName,
+    s.owner_email,
+    s.SO_Line_Qty,
+    s.Line_Quoted_Delivery,
+    s.U_Event,
+    s.U_EventDt,
+    s.U_POPrefix,
+    s.NumAtCard
+FROM TCWorking.dbo.v_ScoredOrderLine s
     WHERE  s.Mode = 'SEA'
       AND  s.IsRailing = 1
       AND  s.PODUnloaded IS NULL
@@ -42,19 +51,22 @@ SELECT
     COUNT(DISTINCT CASE WHEN band = 'late_regardless' THEN ORDR_DocNum END)       AS orders_late_regardless,
     COUNT(DISTINCT CASE WHEN band = 'fine' THEN ORDR_DocNum END)                  AS orders_fine,
     MAX(CASE WHEN band = 'saved' THEN DATEDIFF(day, Line_Quoted_Delivery, rail_eta) END) AS worst_rail_miss_days,
-    STRING_AGG(CASE WHEN band = 'saved' THEN CONCAT(U_POPrefix, '-', NumAtCard) END,', ') 
-    WITHIN GROUP (ORDER BY U_POPrefix, NumAtCard) AS saved_po_list
+   STRING_AGG(CASE WHEN band = 'saved' THEN CONCAT(U_POPrefix, '-', NumAtCard) END, ', ') 
+   WITHIN GROUP (ORDER BY U_POPrefix, NumAtCard) AS saved_po_list
 FROM   banded
 GROUP  BY Container_Number, VesselName, FirstUSPort, current_vessel_eta, divert_deadline, rail_eta, truck_eta
 HAVING COUNT(DISTINCT CASE WHEN band = 'saved' THEN ORDR_DocNum END) > 0
    AND divert_deadline > GETDATE();
 GO
-
+ 
 -- Merch queue. Post-discharge, past promise. U_RevDelivery = notified, U_PriorityInd = expedite.
 CREATE OR ALTER VIEW dbo.v_MerchQueue AS
 SELECT
-    s.U_AssignedTo                                       AS merchandiser,
+    s.owner_email                                        AS merchandiser,
+    s.owner_name,
+    s.item_merchandiser,
     s.ORDR_DocNum, s.RDR1_LineNum, s.ItemCode, s.SO_Line_Qty,
+    CONCAT(s.U_POPrefix, '-', s.NumAtCard)               AS customer_po,
     s.CardCode, s.CardName,
     s.Container_Number, s.Status, s.Location,
     s.Line_Quoted_Delivery                               AS promised,
@@ -75,7 +87,7 @@ WHERE  s.PODUnloaded IS NOT NULL
   AND  s.Line_Quoted_Delivery IS NOT NULL
   AND  s.dock_eta > s.Line_Quoted_Delivery;
 GO
-
+ 
 -- Rollups.
 CREATE OR ALTER VIEW dbo.v_MerchRollup AS
 SELECT
@@ -92,7 +104,7 @@ SELECT
 FROM   TCWorking.dbo.v_MerchQueue
 GROUP  BY merchandiser;
 GO
-
+ 
 CREATE OR ALTER VIEW dbo.v_ContainerRollup AS
 SELECT
     Container_Number, Status, Location,
@@ -105,4 +117,5 @@ SELECT
 FROM   TCWorking.dbo.v_MerchQueue
 GROUP  BY Container_Number, Status, Location;
 GO
-
+ 
+ 
