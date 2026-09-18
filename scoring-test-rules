@@ -1,8 +1,9 @@
-/* TEST BUILD -  */
 
+/* TEST BUILD -  */
+ 
 USE TCWorking;
 GO
-
+ 
 /* 1. GRPO -> PO -> SO.  */
 CREATE OR ALTER VIEW dbo.v_ContainerOrderLink AS
 SELECT DISTINCT
@@ -20,7 +21,12 @@ SELECT DISTINCT
     gl.Quantity                         AS GRPO_Line_Qty,
     s.CardCode,
     s.CardName,
-    s.U_AssignedTo,
+    s.NumAtCard,
+    s.U_POPrefix,
+    s.OwnerCode,
+    own.email                           AS owner_email,
+    own.firstName + ' ' + own.lastName  AS owner_name,
+    itm.U_Merchandiser                  AS item_merchandiser,
     s.U_OrigDelivery,
     s.DocDueDate                        AS SO_Delivery_Date,
     sl.U_QuotedDelivery                 AS Line_Quoted_Delivery,
@@ -40,10 +46,12 @@ JOIN   DRI.dbo.RDR1 sl ON pl.BaseType = 17
               AND sl.DocEntry = pl.BaseEntry
               AND sl.LineNum  = pl.BaseLine
 JOIN   DRI.dbo.ORDR s  ON s.DocEntry  = sl.DocEntry
+LEFT   JOIN DRI.dbo.OHEM own ON own.empID = s.OwnerCode
+LEFT   JOIN DRI.dbo.OITM itm ON itm.ItemCode = sl.ItemCode
 WHERE  gh.U_ContREfNo IS NOT NULL
   AND  gh.U_ContREfNo <> '';
 GO
-
+ 
 /* 2. Latest snapshot per container. First-observed ETA = baseline. */
 CREATE OR ALTER VIEW dbo.v_GnosisCurrent AS
 WITH ranked AS (
@@ -129,7 +137,7 @@ JOIN   base b        ON b.Container_Number  = l.Container_Number
 LEFT   JOIN status_run sr ON sr.Container_Number = l.Container_Number
 WHERE  l.rn_last = 1;
 GO
-
+ 
 /* 3. Latest production status per PO line, with most recent later-direction move. */
 CREATE OR ALTER VIEW dbo.v_ProductionCurrent AS
 WITH prod AS (
@@ -139,7 +147,7 @@ WITH prod AS (
     UNION ALL SELECT 'JF'  AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_JFH_Raw
 ),
 src AS (
-
+ 
     SELECT p.*,
            COALESCE(RevisedExFactoryDate, OriginalExFactoryDate) AS ex_factory_watch
     FROM   prod p
@@ -190,7 +198,7 @@ LEFT   JOIN move_detail md ON md.PO = r.PO AND md.Style = r.Style
                            AND md.Color = r.Color AND md.Size = r.Size
 WHERE  r.rn = 1;
 GO
-
+ 
 /* 4. Scored order line. Container-grain rules inherit to every line on the box. */
 CREATE OR ALTER VIEW dbo.v_ScoredOrderLine AS
 WITH joined AS (
@@ -323,5 +331,3 @@ SELECT c.*,
 FROM combined c;
 GO
 /* MAX of rules, +10 if two exceed 40, event multiplier last. Thresholds provisional - shadow a quarter. */
-
-
