@@ -1,0 +1,327 @@
+/* TEST BUILD -  */
+
+USE TCWorking;
+GO
+
+/* 1. GRPO -> PO -> SO.  */
+CREATE OR ALTER VIEW dbo.v_ContainerOrderLink AS
+SELECT DISTINCT
+    gh.U_ContREfNo                      AS Container_Number,
+    gh.DocNum                           AS GRPO_DocNum,
+    gh.DocDate                          AS GRPO_Date,
+    o.DocNum                            AS OPOR_DocNum,
+    o.CardCode                          AS Factory_CardCode,
+    s.DocNum                            AS ORDR_DocNum,
+    s.DocEntry                          AS ORDR_DocEntry,
+    sl.LineNum                          AS RDR1_LineNum,
+    sl.VisOrder                         AS RDR1_VisOrder,
+    sl.ItemCode,
+    sl.Quantity                         AS SO_Line_Qty,
+    gl.Quantity                         AS GRPO_Line_Qty,
+    s.CardCode,
+    s.CardName,
+    s.U_AssignedTo,
+    s.U_OrigDelivery,
+    s.DocDueDate                        AS SO_Delivery_Date,
+    sl.U_QuotedDelivery                 AS Line_Quoted_Delivery,
+    s.U_QuotedDelivery                  AS Header_Quoted_Delivery,
+    s.U_Event,
+    s.U_EventDt,
+    s.U_EventDateType,
+    s.U_MOT,
+    s.DocStatus
+FROM   DRI.dbo.OPDN gh
+JOIN   DRI.dbo.PDN1 gl ON gl.DocEntry = gh.DocEntry
+JOIN   DRI.dbo.POR1 pl ON gl.BaseType = 22
+              AND pl.DocEntry = gl.BaseEntry
+              AND pl.LineNum  = gl.BaseLine
+JOIN   DRI.dbo.OPOR o  ON o.DocEntry  = pl.DocEntry
+JOIN   DRI.dbo.RDR1 sl ON pl.BaseType = 17
+              AND sl.DocEntry = pl.BaseEntry
+              AND sl.LineNum  = pl.BaseLine
+JOIN   DRI.dbo.ORDR s  ON s.DocEntry  = sl.DocEntry
+WHERE  gh.U_ContREfNo IS NOT NULL
+  AND  gh.U_ContREfNo <> '';
+GO
+
+/* 2. Latest snapshot per container. First-observed ETA = baseline. */
+CREATE OR ALTER VIEW dbo.v_GnosisCurrent AS
+WITH ranked AS (
+    SELECT g.*,
+           ROW_NUMBER() OVER (PARTITION BY Container_Number ORDER BY DateAdded DESC) AS rn_last,
+           ROW_NUMBER() OVER (PARTITION BY Container_Number ORDER BY DateAdded ASC)  AS rn_first
+    FROM   TCWorking.dbo.DRI_Gnosis_Status_Insert g
+),
+base AS (
+    SELECT Container_Number,
+           MIN(DateAdded)                                          AS first_observed,
+           MAX(DateAdded)                                          AS last_observed,
+           MIN(CASE WHEN rn_first = 1 THEN ETAPortOfArrival END)   AS baseline_vessel_eta,
+           MIN(CASE WHEN rn_first = 1 THEN RailETADest END)        AS baseline_rail_eta,
+           COUNT(DISTINCT ETAPortOfArrival)                        AS vessel_eta_revisions,
+           COUNT(DISTINCT RailETADest)                             AS rail_eta_revisions,
+           COUNT(*)                                                AS snapshots,
+           MAX(CASE WHEN RailETADest IS NOT NULL THEN 1 ELSE 0 END) AS ever_rail_eta,
+           MAX(CASE WHEN TrackLocation LIKE 'Awaiting Rail Load%'
+                      OR TrackLocation LIKE 'On Rail%'
+                      OR TrackLocation LIKE 'At Rail Terminal%'
+                      OR TrackLocation LIKE 'Ready to Load%' THEN 1 ELSE 0 END) AS ever_rail_status
+    FROM   ranked
+    GROUP  BY Container_Number
+),
+status_run AS (
+    -- start of current status run
+    SELECT r.Container_Number,
+           MIN(r.DateAdded) AS status_since
+    FROM   ranked r
+    JOIN   ranked cur ON cur.Container_Number = r.Container_Number AND cur.rn_last = 1
+    WHERE  LEFT(r.TrackLocation, CHARINDEX(' - ', r.TrackLocation + ' - ') - 1)
+         = LEFT(cur.TrackLocation, CHARINDEX(' - ', cur.TrackLocation + ' - ') - 1)
+      AND NOT EXISTS (
+            SELECT 1 FROM ranked x
+            WHERE x.Container_Number = r.Container_Number
+              AND x.DateAdded > r.DateAdded AND x.DateAdded < cur.DateAdded
+              AND LEFT(x.TrackLocation, CHARINDEX(' - ', x.TrackLocation + ' - ') - 1)
+               <> LEFT(cur.TrackLocation, CHARINDEX(' - ', cur.TrackLocation + ' - ') - 1))
+    GROUP  BY r.Container_Number
+)
+SELECT
+    l.Container_Number,
+    l.MBL_Number,
+    l.MOT,
+    CASE WHEN l.MOT LIKE 'Air%' THEN 'AIR' ELSE 'SEA' END                          AS Mode,
+    -- IsRailing inferred: rail ETA or rail status ever seen. Air = 0.
+    CASE WHEN l.MOT LIKE 'Air%' THEN 0
+         WHEN b.ever_rail_eta = 1 OR b.ever_rail_status = 1 THEN 1
+         ELSE 0 END                                                                 AS IsRailing,
+    'inferred'                                                                      AS IsRailing_Source,
+    CAST(NULL AS datetime)                                                          AS gnosis_estimated_dc_eta_dt,
+    CAST(NULL AS nvarchar(100))                                                     AS pod_terminal_name,
+    CAST(NULL AS datetime)                                                          AS ts_open_discharged_dt,
+    CAST(NULL AS datetime)                                                          AS ts_open_out_vessel_etd_dt,
+    LEFT(l.TrackLocation, CHARINDEX(' - ', l.TrackLocation + ' - ') - 1)             AS Status,
+    NULLIF(SUBSTRING(l.TrackLocation, CHARINDEX(' - ', l.TrackLocation) + 3, 200), l.TrackLocation) AS Location,
+    l.VesselName,
+    l.FirstUSPort,
+    l.ActShipDt,
+    l.TransshipDate,
+    l.ETAPortOfArrival                    AS current_vessel_eta,
+    b.baseline_vessel_eta,
+    DATEDIFF(day, b.baseline_vessel_eta, l.ETAPortOfArrival)                       AS vessel_eta_drift,
+    l.RailETADest                         AS current_rail_eta,
+    b.baseline_rail_eta,
+    DATEDIFF(day, b.baseline_rail_eta, l.RailETADest)                              AS rail_eta_drift,
+    b.vessel_eta_revisions,
+    b.rail_eta_revisions,
+    l.PODUnloaded,
+    l.FirstUSPortDepartDate,
+    l.RailATA,
+    l.RailDischarged,
+    DATEDIFF(day, l.PODUnloaded, GETDATE())                                        AS days_since_discharge,
+    sr.status_since,
+    DATEDIFF(day, sr.status_since, GETDATE())                                      AS days_in_status,
+    b.first_observed,
+    b.last_observed,
+    DATEDIFF(day, b.last_observed, GETDATE())                                      AS days_since_seen,
+    b.snapshots
+FROM   ranked l
+JOIN   base b        ON b.Container_Number  = l.Container_Number
+LEFT   JOIN status_run sr ON sr.Container_Number = l.Container_Number
+WHERE  l.rn_last = 1;
+GO
+
+/* 3. Latest production status per PO line, with most recent later-direction move. */
+CREATE OR ALTER VIEW dbo.v_ProductionCurrent AS
+WITH prod AS (
+    -- one branch per factory table
+    SELECT 'Unimas' AS factory, * FROM TCWorking.dbo.DRI_ProductionStatus_UNIMAS_Raw
+    UNION ALL SELECT 'RTN' AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_RTN_Raw
+    UNION ALL SELECT 'JF'  AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_JFH_Raw
+),
+src AS (
+
+    SELECT p.*,
+           COALESCE(RevisedExFactoryDate, OriginalExFactoryDate) AS ex_factory_watch
+    FROM   prod p
+),
+ranked AS (
+    SELECT s.*,
+           ROW_NUMBER() OVER (PARTITION BY PO, Style, Color, Size ORDER BY DateAdded DESC) AS rn,
+           LAG(ex_factory_watch) OVER (PARTITION BY PO, Style, Color, Size ORDER BY DateAdded) AS prev_rev,
+           LAG(DateAdded)        OVER (PARTITION BY PO, Style, Color, Size ORDER BY DateAdded) AS prev_obs
+    FROM   src s
+    WHERE  Processed IN ('Y','D')
+),
+last_move AS (
+    -- most recent later-direction move
+    SELECT PO, Style, Color, Size,
+           MAX(DateAdded) AS moved_at
+    FROM   ranked
+    WHERE  prev_rev IS NOT NULL
+      AND  Processed = 'Y'
+      AND  ex_factory_watch > prev_rev
+    GROUP  BY PO, Style, Color, Size
+),
+move_detail AS (
+    SELECT r.PO, r.Style, r.Color, r.Size,
+           r.DateAdded                                        AS moved_at,
+           r.prev_rev                                         AS moved_from,
+           r.ex_factory_watch                                 AS moved_to,
+           DATEDIFF(day, r.prev_rev, r.ex_factory_watch)      AS moved_days,
+           DATEDIFF(day, r.DateAdded, r.prev_rev)             AS lead_at_move
+    FROM   ranked r
+    JOIN   last_move m ON m.PO = r.PO AND m.Style = r.Style AND m.Color = r.Color
+                      AND m.Size = r.Size AND m.moved_at = r.DateAdded
+)
+SELECT
+    r.factory, r.PO, r.Style, r.Color, r.Size, r.MLPI, r.Brand, r.Quantity,
+    r.OPOR_DocNum, r.ORDR_DocNum, r.RDR1_VisOrder,
+    r.ShipmentStatus,
+    r.ShipMode,
+    r.OriginalExFactoryDate,
+    r.RevisedExFactoryDate,
+    r.ex_factory_watch                                                      AS planned_ex_factory,
+    DATEDIFF(day, r.OriginalExFactoryDate, r.RevisedExFactoryDate)          AS ex_factory_slip_vs_original,
+    md.moved_at, md.moved_from, md.moved_to, md.moved_days, md.lead_at_move,
+    r.DateAdded                                                             AS last_reported,
+    DATEDIFF(day, r.DateAdded, GETDATE())                                   AS days_since_reported
+FROM   ranked r
+LEFT   JOIN move_detail md ON md.PO = r.PO AND md.Style = r.Style
+                           AND md.Color = r.Color AND md.Size = r.Size
+WHERE  r.rn = 1;
+GO
+
+/* 4. Scored order line. Container-grain rules inherit to every line on the box. */
+CREATE OR ALTER VIEW dbo.v_ScoredOrderLine AS
+WITH joined AS (
+    SELECT
+        l.*,
+        g.Mode, g.IsRailing, g.IsRailing_Source, g.Status, g.Location, g.VesselName,
+        g.FirstUSPort, g.pod_terminal_name,
+        g.ts_open_discharged_dt, g.ts_open_out_vessel_etd_dt,
+        g.gnosis_estimated_dc_eta_dt,
+        ff.CustomsClearDate,
+        g.current_vessel_eta, g.vessel_eta_drift, g.vessel_eta_revisions,
+        g.current_rail_eta,   g.rail_eta_drift,   g.rail_eta_revisions,
+        g.PODUnloaded, g.days_since_discharge, g.days_in_status, g.days_since_seen,
+        g.RailDischarged,
+        -- warehouse ETA: gnosis dc estimate, else rail discharged / rail ETA+1, else discharge+4
+        COALESCE(
+            g.gnosis_estimated_dc_eta_dt,
+            CASE WHEN g.IsRailing = 1
+                 THEN COALESCE(g.RailDischarged, DATEADD(day, 1, g.current_rail_eta))
+                 ELSE DATEADD(day, 4, COALESCE(g.PODUnloaded, g.current_vessel_eta)) END
+        )                                                                       AS dock_eta,
+        CASE WHEN g.gnosis_estimated_dc_eta_dt IS NOT NULL THEN 'gnosis' ELSE 'derived' END AS dock_eta_source,
+        p.ShipmentStatus, p.planned_ex_factory, p.moved_days, p.lead_at_move,
+        p.days_since_reported
+    FROM TCWorking.dbo.v_ContainerOrderLink l
+    LEFT   JOIN TCWorking.dbo.v_GnosisCurrent     g ON g.Container_Number = l.Container_Number
+    LEFT   JOIN TCWorking.dbo.v_ProductionCurrent p ON p.OPOR_DocNum = l.OPOR_DocNum
+                                      AND p.RDR1_VisOrder = l.RDR1_VisOrder
+    -- FF import: CustomsClearDate only
+    LEFT   JOIN (SELECT ContainerRefNo, MAX(CustomsClearDate) AS CustomsClearDate
+                 FROM   TCWorking.dbo.DRI_FreightForwarder_Status
+                 WHERE  Processed = 'Y' AND CustomsClearDate IS NOT NULL
+                 GROUP  BY ContainerRefNo) ff ON ff.ContainerRefNo = l.Container_Number
+    WHERE  l.DocStatus = 'O'
+),
+rules AS (
+    SELECT j.*,
+        -- R1 post-discharge dwell. Rail baseline 6d (p75), non-rail 5d (placeholder).
+        CASE WHEN PODUnloaded IS NULL THEN 0
+             WHEN Status IN ('On Rail','At Rail Terminal','Out for Delivery','Delivered',
+                             'Empty Returned','Success') THEN 0
+             WHEN IsRailing = 1 AND days_since_discharge >= 6
+                  THEN (CASE WHEN 45 + (days_since_discharge - 6) * 9 > 100 THEN 100 ELSE 45 + (days_since_discharge - 6) * 9 END)
+             WHEN IsRailing = 0 AND Mode = 'SEA' AND days_since_discharge >= 5
+                  THEN (CASE WHEN 40 + (days_since_discharge - 5) * 10 > 100 THEN 100 ELSE 40 + (days_since_discharge - 5) * 10 END)
+             ELSE 0 END                                                                AS r1_dwell,
+        -- R2 rail ETA drift. p75=5 p90=11
+        CASE WHEN IsRailing = 1 AND rail_eta_drift >= 5
+             THEN (CASE WHEN 40 + (rail_eta_drift - 5) * 6 > 90 THEN 90 ELSE 40 + (rail_eta_drift - 5) * 6 END) ELSE 0 END           AS r2_rail_drift,
+        -- R3 vessel ETA drift. p90=5
+        CASE WHEN vessel_eta_drift >= 5
+             THEN (CASE WHEN 35 + (vessel_eta_drift - 5) * 7 > 85 THEN 85 ELSE 35 + (vessel_eta_drift - 5) * 7 END) ELSE 0 END                AS r3_vessel_drift,
+        -- R4 silence. p90 gap=6
+        CASE WHEN Status NOT IN ('Empty Returned','Success') AND days_since_seen >= 4
+             THEN (CASE WHEN 25 + days_since_seen * 15 > 100 THEN 100 ELSE 25 + days_since_seen * 15 END) ELSE 0 END                     AS r4_silence,
+        -- R5 transship connection vs outgoing vessel ETD. Always 0 in test build.
+        CASE WHEN ts_open_discharged_dt IS NOT NULL
+              AND ts_open_out_vessel_etd_dt IS NOT NULL
+              AND GETDATE() > DATEADD(day, 2, ts_open_out_vessel_etd_dt)  THEN 100
+             WHEN ts_open_discharged_dt IS NOT NULL
+              AND ts_open_out_vessel_etd_dt IS NOT NULL
+              AND GETDATE() > ts_open_out_vessel_etd_dt                    THEN 70
+             WHEN ts_open_discharged_dt IS NOT NULL
+              AND ts_open_out_vessel_etd_dt IS NULL
+              AND DATEDIFF(day, ts_open_discharged_dt, GETDATE()) >= 5     THEN 70
+             ELSE 0 END                                                                AS r5_transship,
+        -- R12 customs hold
+        CASE WHEN PODUnloaded IS NOT NULL AND CustomsClearDate IS NULL
+              AND DATEDIFF(day, PODUnloaded, GETDATE()) >= 3                 THEN 70
+             ELSE 0 END                                                                AS r12_customs,
+        -- R6 ex-factory moved later, weighted by lead time at the move
+        CASE WHEN moved_days > 0 AND lead_at_move <= 3  THEN 90
+             WHEN moved_days > 0 AND lead_at_move <= 7  THEN 75
+             WHEN moved_days > 0 AND lead_at_move <= 14 THEN 40
+             ELSE 0 END                                                                AS r6_exfactory_move,
+        -- R8 promise breach
+        CASE WHEN dock_eta IS NULL OR Line_Quoted_Delivery IS NULL THEN 0
+             WHEN DATEDIFF(day, Line_Quoted_Delivery, dock_eta) > 0
+                  THEN (CASE WHEN 40 + DATEDIFF(day, Line_Quoted_Delivery, dock_eta) * 4 > 100 THEN 100 ELSE 40 + DATEDIFF(day, Line_Quoted_Delivery, dock_eta) * 4 END)
+             WHEN DATEDIFF(day, Line_Quoted_Delivery, dock_eta) >= -7 THEN 15
+             ELSE 0 END                                                                AS r8_promise,
+        -- R9 internal breach
+        CASE WHEN dock_eta IS NOT NULL AND DATEDIFF(day, SO_Delivery_Date, dock_eta) > 0
+             THEN (CASE WHEN 25 + DATEDIFF(day, SO_Delivery_Date, dock_eta) * 3 > 85 THEN 85 ELSE 25 + DATEDIFF(day, SO_Delivery_Date, dock_eta) * 3 END) ELSE 0 END AS r9_internal,
+        -- R10 no forward date. Absence scores.
+        CASE WHEN dock_eta IS NULL AND PODUnloaded IS NULL THEN 50
+             WHEN dock_eta IS NULL THEN 35 ELSE 0 END                                  AS r10_no_date,
+        -- R13 event multiplier. 99.0 = hard flag sentinel
+        CASE WHEN U_EventDt IS NULL OR dock_eta IS NULL THEN 1.0
+             WHEN dock_eta > U_EventDt THEN 99.0
+             WHEN DATEDIFF(day, dock_eta, U_EventDt) < 7 THEN 1.5
+             ELSE 1.0 END                                                              AS r13_event_mult
+    FROM joined j
+),
+combined AS (
+    SELECT r.*,
+        (SELECT MAX(v) FROM (VALUES (r1_dwell),(r2_rail_drift),(r3_vessel_drift),(r4_silence),(r5_transship),(r6_exfactory_move),(r8_promise),(r9_internal),(r10_no_date),(r12_customs)) t(v))                                                          AS max_rule,
+        (CASE WHEN r1_dwell          >= 40 THEN 1 ELSE 0 END +
+         CASE WHEN r2_rail_drift     >= 40 THEN 1 ELSE 0 END +
+         CASE WHEN r3_vessel_drift   >= 40 THEN 1 ELSE 0 END +
+         CASE WHEN r4_silence        >= 40 THEN 1 ELSE 0 END +
+         CASE WHEN r5_transship      >= 40 THEN 1 ELSE 0 END +
+         CASE WHEN r6_exfactory_move >= 40 THEN 1 ELSE 0 END +
+         CASE WHEN r8_promise        >= 40 THEN 1 ELSE 0 END +
+         CASE WHEN r12_customs       >= 40 THEN 1 ELSE 0 END)                          AS strong_signals
+    FROM rules r
+)
+SELECT c.*,
+    CASE WHEN r13_event_mult = 99.0 THEN 100
+         ELSE (CASE WHEN CAST((max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END)
+                               * CASE WHEN r13_event_mult = 99.0 THEN 1 ELSE r13_event_mult END AS int) > 100 THEN 100 ELSE CAST((max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END)
+                               * CASE WHEN r13_event_mult = 99.0 THEN 1 ELSE r13_event_mult END AS int) END)
+    END                                                                                AS risk_score,
+    CASE WHEN r13_event_mult = 99.0 THEN 'EVENT MISS'
+         WHEN max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END >= 70 THEN 'CRITICAL'
+         WHEN max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END >= 40 THEN 'HIGH'
+         WHEN max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END >= 20 THEN 'WATCH'
+         ELSE 'OK' END                                                                 AS risk_band,
+    CASE c.max_rule
+         WHEN r1_dwell          THEN 'post_discharge_dwell'
+         WHEN r2_rail_drift     THEN 'rail_drift'
+         WHEN r3_vessel_drift   THEN 'vessel_drift'
+         WHEN r4_silence        THEN 'silence'
+         WHEN r5_transship      THEN 'transship_connection'
+         WHEN r6_exfactory_move THEN 'exfactory_move'
+         WHEN r8_promise        THEN 'promise_breach'
+         WHEN r9_internal       THEN 'internal_breach'
+         WHEN r12_customs       THEN 'customs_hold'
+         ELSE 'no_forward_date' END                                                    AS primary_signal
+FROM combined c;
+GO
+/* MAX of rules, +10 if two exceed 40, event multiplier last. Thresholds provisional - shadow a quarter. */
+
+
