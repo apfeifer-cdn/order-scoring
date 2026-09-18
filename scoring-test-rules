@@ -1,9 +1,8 @@
-
 /* TEST BUILD -  */
- 
+
 USE TCWorking;
 GO
- 
+
 /* 1. GRPO -> PO -> SO.  */
 CREATE OR ALTER VIEW dbo.v_ContainerOrderLink AS
 SELECT DISTINCT
@@ -35,7 +34,11 @@ SELECT DISTINCT
     s.U_EventDt,
     s.U_EventDateType,
     s.U_MOT,
-    s.DocStatus
+    s.DocStatus,
+    gh.U_DivertDecision,
+    gh.U_DivertDecisionETA,
+    CASE WHEN s.U_RevDeliveryToUse = 'L' THEN sl.U_RevDelivery ELSE s.U_RevDelivery END AS ack_eta,
+    sl.U_CustNotifiedDt                 AS notified_dt
 FROM   DRI.dbo.OPDN gh
 JOIN   DRI.dbo.PDN1 gl ON gl.DocEntry = gh.DocEntry
 JOIN   DRI.dbo.POR1 pl ON gl.BaseType = 22
@@ -51,7 +54,7 @@ LEFT   JOIN DRI.dbo.OITM itm ON itm.ItemCode = sl.ItemCode
 WHERE  gh.U_ContREfNo IS NOT NULL
   AND  gh.U_ContREfNo <> '';
 GO
- 
+
 /* 2. Latest snapshot per container. First-observed ETA = baseline. */
 CREATE OR ALTER VIEW dbo.v_GnosisCurrent AS
 WITH ranked AS (
@@ -137,7 +140,7 @@ JOIN   base b        ON b.Container_Number  = l.Container_Number
 LEFT   JOIN status_run sr ON sr.Container_Number = l.Container_Number
 WHERE  l.rn_last = 1;
 GO
- 
+
 /* 3. Latest production status per PO line, with most recent later-direction move. */
 CREATE OR ALTER VIEW dbo.v_ProductionCurrent AS
 WITH prod AS (
@@ -147,7 +150,7 @@ WITH prod AS (
     UNION ALL SELECT 'JF'  AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_JFH_Raw
 ),
 src AS (
- 
+
     SELECT p.*,
            COALESCE(RevisedExFactoryDate, OriginalExFactoryDate) AS ex_factory_watch
     FROM   prod p
@@ -198,7 +201,7 @@ LEFT   JOIN move_detail md ON md.PO = r.PO AND md.Style = r.Style
                            AND md.Color = r.Color AND md.Size = r.Size
 WHERE  r.rn = 1;
 GO
- 
+
 /* 4. Scored order line. Container-grain rules inherit to every line on the box. */
 CREATE OR ALTER VIEW dbo.v_ScoredOrderLine AS
 WITH joined AS (
@@ -206,6 +209,7 @@ WITH joined AS (
         l.*,
         g.Mode, g.IsRailing, g.IsRailing_Source, g.Status, g.Location, g.VesselName,
         g.FirstUSPort, g.pod_terminal_name,
+        l.U_DivertDecision, l.U_DivertDecisionETA, l.ack_eta, l.notified_dt,
         g.ts_open_discharged_dt, g.ts_open_out_vessel_etd_dt,
         g.gnosis_estimated_dc_eta_dt,
         ff.CustomsClearDate,
@@ -215,6 +219,8 @@ WITH joined AS (
         g.RailDischarged,
         -- warehouse ETA: gnosis dc estimate, else rail discharged / rail ETA+1, else discharge+4
         COALESCE(
+            CASE WHEN l.U_DivertDecision = 'DIVERT'
+                 THEN DATEADD(day, 4, COALESCE(g.PODUnloaded, g.current_vessel_eta)) END,
             g.gnosis_estimated_dc_eta_dt,
             CASE WHEN g.IsRailing = 1
                  THEN COALESCE(g.RailDischarged, DATEADD(day, 1, g.current_rail_eta))
@@ -330,4 +336,3 @@ SELECT c.*,
          ELSE 'no_forward_date' END                                                    AS primary_signal
 FROM combined c;
 GO
-/* MAX of rules, +10 if two exceed 40, event multiplier last. Thresholds provisional - shadow a quarter. */
