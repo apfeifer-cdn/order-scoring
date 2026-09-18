@@ -1,4 +1,3 @@
-
 -- Divert queue. Pre-discharge, deadline = vessel ETA - 72h. Save band = late by rail, on time by truck.
 CREATE OR ALTER VIEW dbo.v_DivertQueue AS
 WITH lines AS (
@@ -20,11 +19,16 @@ WITH lines AS (
     s.U_Event,
     s.U_EventDt,
     s.U_POPrefix,
-    s.NumAtCard
+    s.NumAtCard,
+    s.U_DivertDecision,
+    s.U_DivertDecisionETA
 FROM TCWorking.dbo.v_ScoredOrderLine s
     WHERE  s.Mode = 'SEA'
       AND  s.IsRailing = 1
       AND  s.PODUnloaded IS NULL
+      AND  s.U_DivertDecision IS DISTINCT FROM 'DIVERT'
+      AND (s.U_DivertDecision IS NULL
+           OR DATEDIFF(day, s.U_DivertDecisionETA, s.current_vessel_eta) >= 2)
       AND  s.current_vessel_eta IS NOT NULL
       AND  s.Line_Quoted_Delivery IS NOT NULL
 ),
@@ -42,6 +46,9 @@ SELECT
     current_vessel_eta,
     divert_deadline,
     DATEDIFF(hour, GETDATE(), divert_deadline)                                    AS hours_to_deadline,
+    CASE WHEN U_DivertDecision = 'HOLD' THEN 'RE-FIRED' ELSE 'NEW' END           AS queue_state,
+    U_DivertDecisionETA                                                           AS decided_against_eta,
+    DATEDIFF(day, U_DivertDecisionETA, current_vessel_eta)                        AS slipped_since_decision,
     rail_eta,
     truck_eta,
     COUNT(DISTINCT ORDR_DocNum)                                                   AS orders_on_box,
@@ -54,12 +61,13 @@ SELECT
    STRING_AGG(CASE WHEN band = 'saved' THEN CONCAT(U_POPrefix, '-', NumAtCard) END, ', ') 
    WITHIN GROUP (ORDER BY U_POPrefix, NumAtCard) AS saved_po_list
 FROM   banded
-GROUP  BY Container_Number, VesselName, FirstUSPort, current_vessel_eta, divert_deadline, rail_eta, truck_eta
+GROUP  BY Container_Number, VesselName, FirstUSPort, current_vessel_eta, divert_deadline, rail_eta, truck_eta,
+         U_DivertDecision, U_DivertDecisionETA
 HAVING COUNT(DISTINCT CASE WHEN band = 'saved' THEN ORDR_DocNum END) > 0
    AND divert_deadline > GETDATE();
 GO
- 
--- Merch queue. Post-discharge, past promise. U_RevDelivery = notified, U_PriorityInd = expedite.
+
+-- Merch queue. Post-discharge, past promise. ack_eta per U_RevDeliveryToUse; U_CustNotifiedDt = told customer.
 CREATE OR ALTER VIEW dbo.v_MerchQueue AS
 SELECT
     s.owner_email                                        AS merchandiser,
@@ -74,20 +82,23 @@ SELECT
     DATEDIFF(day, s.Line_Quoted_Delivery, s.dock_eta)    AS days_past_promise,
     s.U_Event, s.U_EventDt,
     s.risk_score, s.risk_band, s.primary_signal,
-    o.U_RevDelivery                                      AS revised_delivery_set,
-    o.U_RevDeliveryToUse,
+    s.ack_eta                                            AS acknowledged_eta,
+    s.notified_dt,
     o.U_PriorityInd                                      AS expedite_flag,
-    CASE WHEN o.U_RevDelivery IS NULL THEN 'NOT NOTIFIED'
-         WHEN o.U_RevDelivery < s.dock_eta THEN 'NOTIFIED - STALE'
-         ELSE 'NOTIFIED' END                             AS notify_state
+    DATEDIFF(day, s.ack_eta, s.dock_eta)                 AS slipped_since_ack,
+    CASE WHEN s.ack_eta IS NULL                                       THEN 'OPEN'
+         WHEN DATEDIFF(day, s.ack_eta, s.dock_eta) >= 2               THEN 'STALE'
+         WHEN s.notified_dt IS NOT NULL                               THEN 'NOTIFIED'
+         ELSE 'ACKNOWLEDGED' END                         AS notify_state
 FROM   TCWorking.dbo.v_ScoredOrderLine s
 JOIN   DRI.dbo.ORDR o ON o.DocEntry = s.ORDR_DocEntry
 WHERE  s.PODUnloaded IS NOT NULL
   AND  s.dock_eta IS NOT NULL
   AND  s.Line_Quoted_Delivery IS NOT NULL
-  AND  s.dock_eta > s.Line_Quoted_Delivery;
+  AND  s.dock_eta > s.Line_Quoted_Delivery
+  AND (s.ack_eta IS NULL OR DATEDIFF(day, s.ack_eta, s.dock_eta) >= 2);
 GO
- 
+
 -- Rollups.
 CREATE OR ALTER VIEW dbo.v_MerchRollup AS
 SELECT
@@ -95,8 +106,8 @@ SELECT
     COUNT(DISTINCT ORDR_DocNum)                                              AS impacted_orders,
     COUNT(*)                                                                 AS impacted_lines,
     SUM(SO_Line_Qty)                                                         AS units,
-    COUNT(DISTINCT CASE WHEN notify_state = 'NOT NOTIFIED' THEN ORDR_DocNum END)      AS not_notified,
-    COUNT(DISTINCT CASE WHEN notify_state = 'NOTIFIED - STALE' THEN ORDR_DocNum END)  AS notified_stale,
+    COUNT(DISTINCT CASE WHEN notify_state = 'OPEN'  THEN ORDR_DocNum END)             AS open_items,
+    COUNT(DISTINCT CASE WHEN notify_state = 'STALE' THEN ORDR_DocNum END)             AS re_fired,
     COUNT(DISTINCT CASE WHEN expedite_flag IS NOT NULL THEN ORDR_DocNum END) AS expedite_flagged,
     COUNT(DISTINCT CASE WHEN U_Event = 'Y' THEN ORDR_DocNum END)             AS event_orders,
     MAX(days_past_promise)                                                   AS worst_days_past,
@@ -104,18 +115,17 @@ SELECT
 FROM   TCWorking.dbo.v_MerchQueue
 GROUP  BY merchandiser;
 GO
- 
+
 CREATE OR ALTER VIEW dbo.v_ContainerRollup AS
 SELECT
     Container_Number, Status, Location,
     COUNT(DISTINCT ORDR_DocNum)                                              AS impacted_orders,
     COUNT(DISTINCT merchandiser)                                             AS merchandisers,
     SUM(SO_Line_Qty)                                                         AS units,
-    COUNT(DISTINCT CASE WHEN notify_state = 'NOT NOTIFIED' THEN ORDR_DocNum END) AS not_notified,
+    COUNT(DISTINCT CASE WHEN notify_state = 'OPEN' THEN ORDR_DocNum END)        AS open_items,
+    COUNT(DISTINCT CASE WHEN notify_state = 'STALE' THEN ORDR_DocNum END)       AS re_fired,
     MAX(days_past_promise)                                                   AS worst_days_past,
     MAX(risk_score)                                                          AS worst_score
 FROM   TCWorking.dbo.v_MerchQueue
 GROUP  BY Container_Number, Status, Location;
 GO
- 
- 
