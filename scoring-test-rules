@@ -37,8 +37,8 @@ SELECT DISTINCT
     s.DocStatus,
     gh.U_DivertDecision,
     gh.U_DivertDecisionETA,
-    CASE WHEN s.U_RevDeliveryToUse = 'L' THEN sl.U_RevDelivery ELSE s.U_RevDelivery END AS ack_eta,
-    sl.U_CustNotifiedDt                 AS notified_dt
+    sl.U_CustCommitDt                   AS cust_commit_dt,
+    COALESCE(sl.U_CustCommitDt, sl.U_QuotedDelivery) AS effective_promise
 FROM   DRI.dbo.OPDN gh
 JOIN   DRI.dbo.PDN1 gl ON gl.DocEntry = gh.DocEntry
 JOIN   DRI.dbo.POR1 pl ON gl.BaseType = 22
@@ -209,7 +209,7 @@ WITH joined AS (
         l.*,
         g.Mode, g.IsRailing, g.IsRailing_Source, g.Status, g.Location, g.VesselName,
         g.FirstUSPort, g.pod_terminal_name,
-        l.U_DivertDecision, l.U_DivertDecisionETA, l.ack_eta, l.notified_dt,
+        l.U_DivertDecision, l.U_DivertDecisionETA, l.cust_commit_dt, l.effective_promise,
         g.ts_open_discharged_dt, g.ts_open_out_vessel_etd_dt,
         g.gnosis_estimated_dc_eta_dt,
         ff.CustomsClearDate,
@@ -281,10 +281,10 @@ rules AS (
              WHEN moved_days > 0 AND lead_at_move <= 14 THEN 40
              ELSE 0 END                                                                AS r6_exfactory_move,
         -- R8 promise breach
-        CASE WHEN dock_eta IS NULL OR Line_Quoted_Delivery IS NULL THEN 0
-             WHEN DATEDIFF(day, Line_Quoted_Delivery, dock_eta) > 0
-                  THEN (CASE WHEN 40 + DATEDIFF(day, Line_Quoted_Delivery, dock_eta) * 4 > 100 THEN 100 ELSE 40 + DATEDIFF(day, Line_Quoted_Delivery, dock_eta) * 4 END)
-             WHEN DATEDIFF(day, Line_Quoted_Delivery, dock_eta) >= -7 THEN 15
+        CASE WHEN dock_eta IS NULL OR effective_promise IS NULL THEN 0
+             WHEN DATEDIFF(day, effective_promise, dock_eta) > 0
+                  THEN (CASE WHEN 40 + DATEDIFF(day, effective_promise, dock_eta) * 4 > 100 THEN 100 ELSE 40 + DATEDIFF(day, effective_promise, dock_eta) * 4 END)
+             WHEN DATEDIFF(day, effective_promise, dock_eta) >= -7 THEN 15
              ELSE 0 END                                                                AS r8_promise,
         -- R9 internal breach
         CASE WHEN dock_eta IS NOT NULL AND DATEDIFF(day, SO_Delivery_Date, dock_eta) > 0
