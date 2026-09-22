@@ -1,3 +1,4 @@
+
 -- Divert queue. Pre-discharge, deadline = vessel ETA - 72h. Save band = late by rail, on time by truck.
 CREATE OR ALTER VIEW dbo.v_DivertQueue AS
 WITH lines AS (
@@ -66,8 +67,8 @@ GROUP  BY Container_Number, VesselName, FirstUSPort, current_vessel_eta, divert_
 HAVING COUNT(DISTINCT CASE WHEN band = 'saved' THEN ORDR_DocNum END) > 0
    AND divert_deadline > GETDATE();
 GO
-
--- Merch queue. Post-discharge, past promise. ack_eta per U_RevDeliveryToUse; U_CustNotifiedDt = told customer.
+ 
+-- Merch queue. Post-discharge, past effective promise. U_CustCommitDt = date told to customer; becomes the promise.
 CREATE OR ALTER VIEW dbo.v_MerchQueue AS
 SELECT
     s.owner_email                                        AS merchandiser,
@@ -77,28 +78,23 @@ SELECT
     CONCAT(s.U_POPrefix, '-', s.NumAtCard)               AS customer_po,
     s.CardCode, s.CardName,
     s.Container_Number, s.Status, s.Location,
-    s.Line_Quoted_Delivery                               AS promised,
+    s.Line_Quoted_Delivery                               AS original_promise,
+    s.cust_commit_dt                                     AS customer_told,
+    s.effective_promise,
     s.dock_eta                                           AS warehouse_eta,
-    DATEDIFF(day, s.Line_Quoted_Delivery, s.dock_eta)    AS days_past_promise,
+    DATEDIFF(day, s.effective_promise, s.dock_eta)       AS days_past_promise,
     s.U_Event, s.U_EventDt,
     s.risk_score, s.risk_band, s.primary_signal,
-    s.ack_eta                                            AS acknowledged_eta,
-    s.notified_dt,
     o.U_PriorityInd                                      AS expedite_flag,
-    DATEDIFF(day, s.ack_eta, s.dock_eta)                 AS slipped_since_ack,
-    CASE WHEN s.ack_eta IS NULL                                       THEN 'OPEN'
-         WHEN DATEDIFF(day, s.ack_eta, s.dock_eta) >= 2               THEN 'STALE'
-         WHEN s.notified_dt IS NOT NULL                               THEN 'NOTIFIED'
-         ELSE 'ACKNOWLEDGED' END                         AS notify_state
+    CASE WHEN s.cust_commit_dt IS NULL THEN 'OPEN' ELSE 'STALE' END AS notify_state
 FROM   TCWorking.dbo.v_ScoredOrderLine s
 JOIN   DRI.dbo.ORDR o ON o.DocEntry = s.ORDR_DocEntry
 WHERE  s.PODUnloaded IS NOT NULL
   AND  s.dock_eta IS NOT NULL
-  AND  s.Line_Quoted_Delivery IS NOT NULL
-  AND  s.dock_eta > s.Line_Quoted_Delivery
-  AND (s.ack_eta IS NULL OR DATEDIFF(day, s.ack_eta, s.dock_eta) >= 2);
+  AND  s.effective_promise IS NOT NULL
+  AND  DATEDIFF(day, s.effective_promise, s.dock_eta) >= CASE WHEN s.cust_commit_dt IS NULL THEN 1 ELSE 2 END;
 GO
-
+ 
 -- Rollups.
 CREATE OR ALTER VIEW dbo.v_MerchRollup AS
 SELECT
@@ -115,7 +111,7 @@ SELECT
 FROM   TCWorking.dbo.v_MerchQueue
 GROUP  BY merchandiser;
 GO
-
+ 
 CREATE OR ALTER VIEW dbo.v_ContainerRollup AS
 SELECT
     Container_Number, Status, Location,
@@ -129,3 +125,5 @@ SELECT
 FROM   TCWorking.dbo.v_MerchQueue
 GROUP  BY Container_Number, Status, Location;
 GO
+ 
+ 
