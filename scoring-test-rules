@@ -148,6 +148,10 @@ WITH prod AS (
     SELECT 'Unimas' AS factory, * FROM TCWorking.dbo.DRI_ProductionStatus_UNIMAS_Raw
     UNION ALL SELECT 'RTN' AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_RTN_Raw
     UNION ALL SELECT 'JF'  AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_JFH_Raw
+    UNION ALL SELECT 'ASI' as factory, * FROM TCWorking.dbo.CDN_ProductionStatus_ASI_Raw
+    UNION ALL SELECT 'AYM' as factory, * FROM TCWorking.dbo.CDN_ProductionStatus_AYM_Raw
+    UNION ALL SELECT 'MLMX' as factory, * FROM TCWorking.dbo.CDN_ProductionStatus_MLMX_Raw
+    UNION ALL SELECT 'Unipax' as factory * FROM TCWorking.dbo.CDN_ProductionStatus_Unip_Raw
 ),
 src AS (
 
