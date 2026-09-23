@@ -206,7 +206,7 @@ LEFT   JOIN move_detail md ON md.PO = r.PO AND md.Style = r.Style
 WHERE  r.rn = 1;
 GO
 
-/* 4. Scored order line. Container-grain rules inherit to every line on the box. */
+/* 4. Scored order line. Container rules inherit to every line on the box. */
 CREATE OR ALTER VIEW dbo.v_ScoredOrderLine AS
 WITH joined AS (
     SELECT
