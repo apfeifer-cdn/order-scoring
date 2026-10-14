@@ -2,8 +2,8 @@
 
 USE TCWorking;
 GO
--- Adjust variables as needed.
-DECLARE @Output     varchar(20)   = 'Parcel' -- Scored | Divert | Merch | MerchRollup | ContainerRollup | DDTOrders | Parcel
+-- Define variable scope.
+DECLARE @Output     varchar(20)   = 'Scored';   -- Scored | Divert | Merch | MerchRollup | ContainerRollup | DDTOrders | Parcel
 DECLARE @OwnerEmail nvarchar(100) = NULL;       -- Merch only
 DECLARE @Segment    varchar(3)    = 'ALL';     -- ALL | CDN | DDT | BCS
 DECLARE @DDTTransferDays int      = 2;          -- days from DRI dock to shippaed for DDT Stock Orders
@@ -28,9 +28,9 @@ SELECT DISTINCT
     gl.Quantity                         AS GRPO_Line_Qty,
     s.CardCode,
     s.CardName,
-    s.NumAtCard,
+    s.NumAtCard                         AS customer_po,
     s.U_POPrefix,
-    CONCAT(s.U_POPrefix, '-', s.NumAtCard) AS customer_po,
+    CONCAT(s.U_POPrefix, o.DocNum) AS DRI_po,
     s.OwnerCode,
     own.email                           AS owner_email,
     own.firstName + ' ' + own.lastName  AS owner_name,
@@ -606,7 +606,7 @@ WITH so AS (
     SELECT s.*, o.DocEntry AS ORDR_DocEntry, o.CardCode, o.CardName, o.OwnerCode,
            CASE WHEN o.CardCode IN ('C00197','C00231','C00243','C00525','C005256') THEN 'BCS'
                 WHEN o.CardCode IN ('C00229') THEN 'DDT' ELSE 'CDN' END AS segment,
-           CONCAT(o.U_POPrefix,'-',o.NumAtCard) AS customer_po, o.U_Event, o.U_EventDt,
+           o.NumAtCard AS customer_po, CONCAT(o.U_POPrefix, o.DocNum) AS DRI_po, o.U_Event, o.U_EventDt,
            CASE WHEN own.email IS NULL OR own.lastName = 'Manager'
                 THEN (SELECT TOP 1 i.U_Merchandiser FROM DRI.dbo.RDR1 l JOIN DRI.dbo.OITM i ON i.ItemCode = l.ItemCode WHERE l.DocEntry = o.DocEntry ORDER BY l.LineNum)
                 ELSE own.email END AS route_to,
@@ -724,8 +724,8 @@ WITH lines AS (
     s.Line_Quoted_Delivery,
     s.U_Event,
     s.U_EventDt,
-    s.U_POPrefix,
-    s.NumAtCard,
+    s.customer_po,
+    s.DRI_po,
     s.U_DivertDecision,
     s.U_DivertDecisionETA,
     s.segment
@@ -768,8 +768,8 @@ SELECT
     COUNT(DISTINCT CASE WHEN band = 'late_regardless' THEN ORDR_DocNum END)       AS orders_late_regardless,
     COUNT(DISTINCT CASE WHEN band = 'fine' THEN ORDR_DocNum END)                  AS orders_fine,
     MAX(CASE WHEN band = 'saved' THEN DATEDIFF(day, Line_Quoted_Delivery, rail_eta) END) AS worst_rail_miss_days,
-   STRING_AGG(CASE WHEN band = 'saved' THEN CONCAT(U_POPrefix, '-', NumAtCard) END, ', ') 
-   WITHIN GROUP (ORDER BY U_POPrefix, NumAtCard) AS saved_po_list
+   STRING_AGG(CASE WHEN band = 'saved' THEN customer_po END, ', ')
+   WITHIN GROUP (ORDER BY customer_po) AS saved_po_list
 FROM   banded
 GROUP  BY Container_Number, VesselName, FirstUSPort, current_vessel_eta, divert_deadline, rail_eta, truck_eta,
          U_DivertDecision, U_DivertDecisionETA
