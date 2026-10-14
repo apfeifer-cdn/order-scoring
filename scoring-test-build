@@ -1,16 +1,20 @@
+/* AP Test Build Rev.10/9/26 */
+
 USE TCWorking;
 GO
-CREATE OR ALTER PROCEDURE dbo.usp_InboundRisk
-    @Output     varchar(20) = 'Scored',     -- Scored | Divert | Merch | MerchRollup | ContainerRollup
-    @OwnerEmail nvarchar(100) = NULL         -- Merch only
-AS
-BEGIN
+-- Adjust variables as needed.
+DECLARE @Output     varchar(20)   = 'Parcel' -- Scored | Divert | Merch | MerchRollup | ContainerRollup | DDTOrders | Parcel
+DECLARE @OwnerEmail nvarchar(100) = NULL;       -- Merch only
+DECLARE @Segment    varchar(3)    = 'ALL';     -- ALL | CDN | DDT | BCS
+DECLARE @DDTTransferDays int      = 2;          -- days from DRI dock to shippaed for DDT Stock Orders
 SET NOCOUNT ON;
+DROP TABLE IF EXISTS #Link, #Gnosis, #Prod, #Scored, #Merch, #ParcelRaw, #Parcel, #ParcelScored;
 
--- 1. GRPO -> PO -> SO
+-- 1. Link GRPO, PO, and SO. 
 SELECT * INTO #Link FROM (
 SELECT DISTINCT
     gh.U_ContREfNo                      AS Container_Number,
+    CASE WHEN gh.U_ContREfNo LIKE '[A-Z][A-Z][A-Z][UJZ][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' THEN 'CONTAINER' ELSE 'AIR_PARCEL' END AS ref_type,   -- ISO 6346: 4th character will be U/J/Z
     gh.DocNum                           AS GRPO_DocNum,
     gh.DocDate                          AS GRPO_Date,
     o.DocNum                            AS OPOR_DocNum,
@@ -26,10 +30,13 @@ SELECT DISTINCT
     s.CardName,
     s.NumAtCard,
     s.U_POPrefix,
+    CONCAT(s.U_POPrefix, '-', s.NumAtCard) AS customer_po,
     s.OwnerCode,
     own.email                           AS owner_email,
     own.firstName + ' ' + own.lastName  AS owner_name,
     itm.U_Merchandiser                  AS item_merchandiser,
+    -- routing key: order owner unless missing or the generic manager account, else item merchandiser
+    CASE WHEN own.email IS NULL OR own.lastName = 'Manager' THEN itm.U_Merchandiser ELSE own.email END AS route_to,
     s.U_OrigDelivery                    AS SO_OriginalDelivery,
     s.U_RevDelivery                     AS SO_RevisedDelivery,
     sl.U_QuotedDelivery                 AS Line_Quoted_Delivery,
@@ -41,8 +48,26 @@ SELECT DISTINCT
     s.DocStatus,
     gh.U_DivertDecision,
     gh.U_DivertDecisionETA,
-    sl.U_CustCommitDt                   AS cust_commit_dt,
-    COALESCE(sl.U_CustCommitDt, sl.U_QuotedDelivery) AS effective_promise
+    sl.U_CustomerCommitDt                 AS cust_commit_dt,           
+    CASE WHEN bcs.ReqDate IS NOT NULL THEN 'BCS' WHEN ddt.ReqDate IS NOT NULL THEN 'DDT' END AS affiliate,
+    CASE WHEN s.CardCode IN ('C00197','C00231','C00243','C00525','C005256') THEN 'BCS'
+         WHEN s.CardCode IN ('C00229') THEN 'DDT' ELSE 'CDN' END AS segment,
+    COALESCE(bcs.ReqDate, ddt.ReqDate)             AS aff_req_date,
+    COALESCE(bcs.CancelDate, ddt.CancelDate)       AS aff_cancel_date,
+    bcs.U_OrigShipDt                               AS aff_orig_ship,
+    COALESCE(bcs.bcs_po_type, ddt.po_type)         AS aff_po_type,
+    COALESCE(bcs.bcs_item, ddt.item)               AS aff_item,
+    COALESCE(binv.on_hand, dinv.on_hand)           AS aff_on_hand,
+    COALESCE(binv.committed, dinv.committed)       AS aff_committed,
+    COALESCE(binv.on_hand - binv.committed, dinv.on_hand - dinv.committed) AS aff_available,
+    COALESCE(binv.daily_velocity, dinv.daily_velocity) AS aff_daily_velocity,
+    CASE WHEN COALESCE(binv.daily_velocity, dinv.daily_velocity) > 0
+         THEN COALESCE(binv.on_hand - binv.committed, dinv.on_hand - dinv.committed) / COALESCE(binv.daily_velocity, dinv.daily_velocity) END AS aff_days_cover,
+    ddt.po_open_qty                                AS aff_po_open_qty,
+    dd.ddt_open_orders, dd.ddt_open_units, dd.ddt_earliest_ship,
+    dd.ddt_orders_on_box, dd.ddt_units_on_box, dd.ddt_box_earliest_ship, dd.ddt_orders_short_after,
+    -- promise: customer commit if set, else BCS required-at-warehouse, else first DDT customer this box feeds, else DDT PO date, else quoted
+    COALESCE(sl.U_CustomerCommitDt, bcs.ReqDate, dd.ddt_box_earliest_ship, ddt.ReqDate, sl.U_QuotedDelivery) AS effective_promise
 FROM   DRI.dbo.OPDN gh
 JOIN   DRI.dbo.PDN1 gl ON gl.DocEntry = gh.DocEntry
 JOIN   DRI.dbo.POR1 pl ON gl.BaseType = 22
@@ -55,6 +80,62 @@ JOIN   DRI.dbo.RDR1 sl ON pl.BaseType = 17
 JOIN   DRI.dbo.ORDR s  ON s.DocEntry  = sl.DocEntry
 LEFT   JOIN DRI.dbo.OHEM own ON own.empID = s.OwnerCode
 LEFT   JOIN DRI.dbo.OITM itm ON itm.ItemCode = sl.ItemCode
+-- Match BCS PO to DRI SO line. Scoped by CardCode. Add card codes in this section if BCS adds new business verticals. 
+OUTER  APPLY (
+    -- If the BCS PO has a customer PO: use the dates from the BCS sales order. For Stock POs: dates from the BCS PO itself.
+    SELECT TOP 1
+           COALESCE(bo.ReqDate,    bp.ReqDate, bp.DocDueDate) AS ReqDate,
+           COALESCE(bo.CancelDate, bp.CancelDate)             AS CancelDate,
+           bo.U_OrigShipDt,
+           CASE WHEN bo.DocEntry IS NOT NULL THEN 'customer' ELSE 'stock' END AS bcs_po_type,
+           bl.ItemCode AS bcs_item
+    FROM   BCS.dbo.OPOR bp
+    JOIN   BCS.dbo.POR1 bl ON bl.DocEntry = bp.DocEntry AND bl.U_StMaster IS NOT NULL
+    LEFT   JOIN BCS.dbo.ORDR bo ON bo.DocEntry = bl.BaseEntry AND bl.BaseType = 17
+    WHERE  s.CardCode IN ('C00197','C00231','C00243','C00525','C005256')
+      AND  bp.DocNum = TRY_CAST(sl.U_BCSNo AS int)
+) bcs
+OUTER  APPLY (
+    SELECT SUM(w.OnHand) AS on_hand, SUM(w.IsCommited) AS committed,
+           (SELECT ISNULL(SUM(i.Quantity),0) / 90.0 FROM BCS.dbo.INV1 i WHERE i.ItemCode = bcs.bcs_item AND i.DocDate >= DATEADD(day,-90,GETDATE())) AS daily_velocity
+    FROM   BCS.dbo.OITW w WHERE w.ItemCode = bcs.bcs_item AND bcs.bcs_po_type = 'stock'
+) binv
+-- DDT PO to DRI SO 
+OUTER  APPLY (
+    SELECT TOP 1 COALESCE(bp.ReqDate, bp.DocDueDate) AS ReqDate, bp.CancelDate, 'stock' AS po_type,
+           pl.ItemCode AS item, pl.OpenQty AS po_open_qty
+    FROM   Driduck.dbo.OPOR bp
+    JOIN   Driduck.dbo.POR1 pl ON pl.DocEntry = bp.DocEntry AND pl.ItemCode = sl.ItemCode
+    WHERE  s.CardCode IN ('C00229')                 -- add other DDT codes from DRI SAP here if there are any.
+      AND  bp.DocNum = TRY_CAST(sl.U_CustPO AS int)
+) ddt
+-- DDT inventory scoped to whs 01
+OUTER  APPLY (
+    SELECT SUM(w.OnHand) AS on_hand, SUM(w.IsCommited) AS committed, SUM(w.OnOrder) AS on_order,
+           (SELECT ISNULL(SUM(i.Quantity),0) / 90.0 FROM Driduck.dbo.INV1 i WHERE i.ItemCode = ddt.item AND i.WhsCode = '01' AND i.DocDate >= DATEADD(day,-90,GETDATE())) AS daily_velocity
+    FROM   Driduck.dbo.OITW w WHERE w.ItemCode = ddt.item AND w.WhsCode = '01'
+) dinv
+-- DDT open demand in whs 01, allocated oldest ShipDate first: on-hand covers it, this box covers it, or short regardless
+OUTER  APPLY (
+    SELECT COUNT(DISTINCT d.DocNum)                                             AS ddt_open_orders,
+           SUM(d.OpenQty)                                                       AS ddt_open_units,
+           MIN(d.ShipDate)                                                      AS ddt_earliest_ship,
+           COUNT(DISTINCT CASE WHEN d.bucket = 'this_box' THEN d.DocNum END)    AS ddt_orders_on_box,
+           SUM(CASE WHEN d.bucket = 'this_box' THEN d.OpenQty ELSE 0 END)       AS ddt_units_on_box,
+           MIN(CASE WHEN d.bucket = 'this_box' THEN d.ShipDate END)             AS ddt_box_earliest_ship,
+           COUNT(DISTINCT CASE WHEN d.bucket = 'short_after' THEN d.DocNum END) AS ddt_orders_short_after
+    FROM (
+        SELECT o.DocNum, l.ShipDate, l.OpenQty,
+               CASE WHEN SUM(l.OpenQty) OVER (ORDER BY l.ShipDate, o.DocDate, o.DocNum, l.LineNum ROWS UNBOUNDED PRECEDING) <= dinv.on_hand THEN 'on_hand'
+                    WHEN SUM(l.OpenQty) OVER (ORDER BY l.ShipDate, o.DocDate, o.DocNum, l.LineNum ROWS UNBOUNDED PRECEDING) <= dinv.on_hand + ddt.po_open_qty THEN 'this_box'
+                    ELSE 'short_after' END AS bucket
+        FROM   Driduck.dbo.RDR1 l
+        JOIN   Driduck.dbo.ORDR o ON o.DocEntry = l.DocEntry
+        WHERE  l.ItemCode = ddt.item AND l.WhsCode = '01' AND l.LineStatus = 'O'
+          AND  o.DocStatus = 'O' AND o.CANCELED = 'N'
+    ) d
+    WHERE ddt.item IS NOT NULL
+) dd
 WHERE  gh.U_ContREfNo IS NOT NULL
   AND  gh.U_ContREfNo <> ''
 ) x;
@@ -115,7 +196,12 @@ SELECT
     CAST(NULL AS datetime)                                                          AS ts_open_discharged_dt,
     CAST(NULL AS datetime)                                                          AS ts_open_out_vessel_etd_dt,
     LEFT(l.TrackLocation, CHARINDEX(' - ', l.TrackLocation + ' - ') - 1)             AS Status,
-    NULLIF(SUBSTRING(l.TrackLocation, CHARINDEX(' - ', l.TrackLocation) + 3, 200), l.TrackLocation) AS Location,
+    CASE WHEN CHARINDEX(' - ', l.TrackLocation) > 0 THEN SUBSTRING(l.TrackLocation, CHARINDEX(' - ', l.TrackLocation) + 3, 200) END AS Location,
+    -- active = not in one of these statuses and not rail-discharged 5+ days ago
+    CASE WHEN LEFT(l.TrackLocation, CHARINDEX(' - ', l.TrackLocation + ' - ') - 1)
+              IN ('Empty Returned','Delivered','Success','Dropped','Not Tracking','Failure') THEN 0
+         WHEN l.RailDischarged IS NOT NULL AND DATEDIFF(day, l.RailDischarged, GETDATE()) >= 5 THEN 0
+         ELSE 1 END                                                                 AS is_active,
     l.VesselName,
     l.FirstUSPort,
     l.ActShipDt,
@@ -147,13 +233,22 @@ WHERE  l.rn_last = 1
 
 -- 3. Latest production status per PO line
 WITH prod AS (
-    -- one branch per factory table
-    SELECT 'Unimas' AS factory, * FROM TCWorking.dbo.DRI_ProductionStatus_UNIMAS_Raw
-    UNION ALL SELECT 'RTN' AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_RTN_Raw
-    UNION ALL SELECT 'JF'  AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_JFH_Raw
-    UNION ALL SELECT 'ASI' AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_ASI_Raw
-    UNION ALL SELECT 'AYM' AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_AYM_Raw
-    UNION ALL SELECT 'UNIP' AS factory, * FROM TCWorking.dbo.CDN_ProductionStatus_UNIP_Raw
+    -- one branch per factory table. Pulled explicit columns because there is no data normalization. 
+    SELECT 'Unimas' AS factory, ORDR_DocNum, RDR1_VisOrder, OPOR_DocNum, PO, Style, Color, Size, MLPI, Brand, Quantity,
+           OriginalExFactoryDate, RevisedExFactoryDate, ShipmentStatus, ShipMode, Processed, BatchID, Filename, DateAdded
+    FROM TCWorking.dbo.DRI_ProductionStatus_UNIMAS_Raw
+    UNION ALL
+    SELECT 'RTN' AS factory, ORDR_DocNum, RDR1_VisOrder, OPOR_DocNum, PO, Style, Color, Size, MLPI, Brand, Quantity,
+           OriginalExFactoryDate, RevisedExFactoryDate, ShipmentStatus, ShipMode, Processed, BatchID, Filename, DateAdded
+    FROM TCWorking.dbo.CDN_ProductionStatus_RTN_Raw
+    UNION ALL
+    SELECT 'AYM' AS factory, ORDR_DocNum, RDR1_VisOrder, OPOR_DocNum, PO, Style, Color, Size, CAST(NULL AS nvarchar(50)) AS MLPI, Brand, Quantity,
+           OriginalExFactoryDate, RevisedExFactoryDate, ShipmentStatus, CAST(NULL AS nvarchar(50)) AS ShipMode, Processed, BatchID, Filename, DateAdded
+    FROM TCWorking.dbo.CDN_ProductionStatus_AYM_Raw
+    UNION ALL
+    SELECT 'UNIP' AS factory, ORDR_DocNum, RDR1_VisOrder, OPOR_DocNum, PO, Style, Color, Size, MLPI, Brand, Quantity,
+           OriginalExFactoryDate, RevisedExFactoryDate, ShipmentStatus, ShipMode, Processed, BatchID, Filename, DateAdded
+    FROM TCWorking.dbo.CDN_ProductionStatus_UNIP_Raw
 ),
 src AS (
 
@@ -170,7 +265,7 @@ ranked AS (
     WHERE  Processed IN ('Y','D')
 ),
 last_move AS (
-    -- most recent later-direction move
+    -- most recent ex-factory date push out
     SELECT PO, Style, Color, Size,
            MAX(DateAdded) AS moved_at
     FROM   ranked
@@ -214,11 +309,10 @@ WITH joined AS (
     SELECT
         l.*,
         g.Mode, g.IsRailing, g.IsRailing_Source, g.Status, g.Location, g.VesselName,
-        g.FirstUSPort, g.pod_terminal_name,
-        l.U_DivertDecision, l.U_DivertDecisionETA, l.cust_commit_dt, l.effective_promise,
+        g.FirstUSPort, g.pod_terminal_name, g.ActShipDt,
         g.ts_open_discharged_dt, g.ts_open_out_vessel_etd_dt,
         g.gnosis_estimated_dc_eta_dt,
-        ff.CustomsClearDate,
+        ff.CustomsClearDate, ff.ff_present,
         g.current_vessel_eta, g.vessel_eta_drift, g.vessel_eta_revisions,
         g.current_rail_eta,   g.rail_eta_drift,   g.rail_eta_revisions,
         g.PODUnloaded, g.days_since_discharge, g.days_in_status, g.days_since_seen,
@@ -229,7 +323,9 @@ WITH joined AS (
                  THEN DATEADD(day, 4, COALESCE(g.PODUnloaded, g.current_vessel_eta)) END,
             g.gnosis_estimated_dc_eta_dt,
             CASE WHEN g.IsRailing = 1
-                 THEN COALESCE(g.RailDischarged, DATEADD(day, 1, g.current_rail_eta))
+                 THEN COALESCE(g.RailDischarged, DATEADD(day, 1, g.current_rail_eta),
+                               -- If the vessel hasn't discharged then use vessel ETA + average dwell + IPI + 1
+                               DATEADD(day, 3 + CASE WHEN g.FirstUSPort LIKE 'New York%' THEN 10 ELSE 9 END + 1, g.current_vessel_eta))
                  ELSE DATEADD(day, 4, COALESCE(g.PODUnloaded, g.current_vessel_eta)) END
         )                                                                       AS dock_eta,
         CASE WHEN g.gnosis_estimated_dc_eta_dt IS NOT NULL THEN 'gnosis' ELSE 'derived' END AS dock_eta_source,
@@ -240,11 +336,20 @@ WITH joined AS (
     LEFT   JOIN #Prod p ON p.OPOR_DocNum = l.OPOR_DocNum
                                       AND p.RDR1_VisOrder = l.RDR1_VisOrder
     -- FF import: CustomsClearDate only
-    LEFT   JOIN (SELECT ContainerRefNo, MAX(CustomsClearDate) AS CustomsClearDate
+    LEFT   JOIN (SELECT ContainerRefNo, MAX(CustomsClearDate) AS CustomsClearDate, 1 AS ff_present
                  FROM   TCWorking.dbo.DRI_FreightForwarder_Status
-                 WHERE  Processed = 'Y' AND CustomsClearDate IS NOT NULL
+                 WHERE  Processed = 'Y'
                  GROUP  BY ContainerRefNo) ff ON ff.ContainerRefNo = l.Container_Number
     WHERE  l.DocStatus = 'O'
+      AND  (@Segment = 'ALL' OR l.segment = @Segment)
+      AND  l.ref_type = 'CONTAINER'                     -- air and parcel refs are a separate phase
+      AND  ISNULL(g.is_active, 1) = 1
+      -- If there's no Gnosis row and the GRPO is older than 75d = delivered before tracking existed. Exclude.
+      AND  NOT (g.Status IS NULL AND DATEDIFF(day, l.GRPO_Date, GETDATE()) > 75)
+),
+cont AS (
+    SELECT Container_Number, COUNT(DISTINCT ORDR_DocNum) AS container_orders, SUM(SO_Line_Qty) AS container_units
+    FROM   joined GROUP BY Container_Number
 ),
 rules AS (
     SELECT j.*,
@@ -277,27 +382,41 @@ rules AS (
               AND ts_open_out_vessel_etd_dt IS NULL
               AND DATEDIFF(day, ts_open_discharged_dt, GETDATE()) >= 5     THEN 70
              ELSE 0 END                                                                AS r5_transship,
-        -- R12 customs hold
-        CASE WHEN PODUnloaded IS NOT NULL AND CustomsClearDate IS NULL
+        -- R12 customs hold. FF row present, still at port. On rail = cleared by definition
+        CASE WHEN ff_present = 1 AND PODUnloaded IS NOT NULL AND CustomsClearDate IS NULL
+              AND Status IN ('Awaiting Discharge','At Ocean Terminal','Awaiting Rail Load')
               AND DATEDIFF(day, PODUnloaded, GETDATE()) >= 3                 THEN 70
              ELSE 0 END                                                                AS r12_customs,
         -- R6 ex-factory moved later, weighted by how much lead time is left at the move
-        CASE WHEN moved_days > 0 AND lead_at_move <= 3  THEN 90
-             WHEN moved_days > 0 AND lead_at_move <= 7  THEN 75
-             WHEN moved_days > 0 AND lead_at_move <= 14 THEN 40
+        CASE WHEN ActShipDt IS NOT NULL OR moved_days IS NULL OR moved_days <= 0 OR lead_at_move < 0 THEN 0
+             WHEN lead_at_move <= 3  THEN 90
+             WHEN lead_at_move <= 7  THEN 75
+             WHEN lead_at_move <= 14 THEN 40
              ELSE 0 END                                                                AS r6_exfactory_move,
-        -- R8 promise breach
+        -- R8 promise breach. Affiliate stock lines: cap by days of cover. Covered through the delay = 40. Out of stock = full.
         CASE WHEN dock_eta IS NULL OR effective_promise IS NULL THEN 0
-             WHEN DATEDIFF(day, effective_promise, dock_eta) > 0
-                  THEN (CASE WHEN 40 + DATEDIFF(day, effective_promise, dock_eta) * 4 > 100 THEN 100 ELSE 40 + DATEDIFF(day, effective_promise, dock_eta) * 4 END)
+             WHEN DATEDIFF(day, effective_promise, dock_eta) > 0 THEN
+                  (CASE
+                     WHEN aff_po_type = 'stock' AND aff_days_cover >= DATEDIFF(day, effective_promise, dock_eta)
+                          THEN 40
+                     WHEN aff_po_type = 'stock' AND aff_available > 0
+                          THEN (CASE WHEN 40 + DATEDIFF(day, effective_promise, dock_eta) * 4 > 70 THEN 70 ELSE 40 + DATEDIFF(day, effective_promise, dock_eta) * 4 END)
+                     ELSE (CASE WHEN 40 + DATEDIFF(day, effective_promise, dock_eta) * 4 > 100 THEN 100 ELSE 40 + DATEDIFF(day, effective_promise, dock_eta) * 4 END)
+                   END)
              WHEN DATEDIFF(day, effective_promise, dock_eta) >= -7 THEN 15
              ELSE 0 END                                                                AS r8_promise,
-        -- R9 internal breach vs revised internal date, original if none
+        -- R9 internal breach vs revised internal date, original if none. Cap 60, below R8 floor
         CASE WHEN dock_eta IS NOT NULL AND DATEDIFF(day, COALESCE(SO_RevisedDelivery, SO_OriginalDelivery), dock_eta) > 0
-             THEN (CASE WHEN 25 + DATEDIFF(day, COALESCE(SO_RevisedDelivery, SO_OriginalDelivery), dock_eta) * 3 > 85 THEN 85 ELSE 25 + DATEDIFF(day, COALESCE(SO_RevisedDelivery, SO_OriginalDelivery), dock_eta) * 3 END) ELSE 0 END AS r9_internal,
+             THEN (CASE WHEN 25 + DATEDIFF(day, COALESCE(SO_RevisedDelivery, SO_OriginalDelivery), dock_eta) * 3 > 60 THEN 60 ELSE 25 + DATEDIFF(day, COALESCE(SO_RevisedDelivery, SO_OriginalDelivery), dock_eta) * 3 END) ELSE 0 END AS r9_internal,
         -- R10 no forward date. Flags orders that don't meet our criteria for scoring so they bubble up. 
-        CASE WHEN dock_eta IS NULL AND PODUnloaded IS NULL THEN 50
+        CASE WHEN Status IS NULL THEN 40                    -- no Gnosis row, GRPO recent: genuinely untracked
+             WHEN dock_eta IS NULL AND PODUnloaded IS NULL THEN 50
              WHEN dock_eta IS NULL THEN 35 ELSE 0 END                                  AS r10_no_date,
+        -- R14 affiliate cancel date. Past = dead order. Inside 7d = multiplier.
+        CASE WHEN aff_cancel_date IS NULL OR dock_eta IS NULL THEN 1.0
+             WHEN dock_eta > aff_cancel_date THEN 99.0
+             WHEN DATEDIFF(day, dock_eta, aff_cancel_date) < 7 THEN 1.5
+             ELSE 1.0 END                                                              AS r14_cancel_mult,
         -- R13 event multiplier. 99.0 = hard flag. 
         CASE WHEN U_EventDt IS NULL OR dock_eta IS NULL THEN 1.0
              WHEN dock_eta > U_EventDt THEN 99.0
@@ -317,33 +436,273 @@ combined AS (
          CASE WHEN r8_promise        >= 40 THEN 1 ELSE 0 END +
          CASE WHEN r12_customs       >= 40 THEN 1 ELSE 0 END)                          AS strong_signals
     FROM rules r
+),
+scored0 AS (
+    SELECT c.*,
+        (CASE WHEN CAST((max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END)
+                    * (CASE WHEN r13_event_mult > r14_cancel_mult THEN r13_event_mult ELSE r14_cancel_mult END) AS int) > 100 THEN 100
+              ELSE CAST((max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END)
+                    * (CASE WHEN r13_event_mult > r14_cancel_mult THEN r13_event_mult ELSE r14_cancel_mult END) AS int) END) AS base_score
+    FROM combined c
 )
 SELECT * INTO #Scored FROM (
 SELECT c.*,
-    CASE WHEN r13_event_mult = 99.0 THEN 100
-         ELSE (CASE WHEN CAST((max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END)
-                               * CASE WHEN r13_event_mult = 99.0 THEN 1 ELSE r13_event_mult END AS int) > 100 THEN 100 ELSE CAST((max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END)
-                               * CASE WHEN r13_event_mult = 99.0 THEN 1 ELSE r13_event_mult END AS int) END)
+    CASE WHEN r13_event_mult = 99.0 OR r14_cancel_mult = 99.0 THEN 100
+         -- Our stock is covered through the delay: ceiling 50. Out of stock and late: floor 70.
+         WHEN aff_po_type = 'stock' AND dock_eta > effective_promise
+              AND aff_days_cover >= DATEDIFF(day, effective_promise, dock_eta)
+              AND base_score > 50 THEN 50
+         WHEN aff_po_type = 'stock' AND dock_eta > effective_promise
+              AND aff_available <= 0 AND base_score < 70 THEN 70
+         ELSE base_score
     END                                                                                AS risk_score,
     CASE WHEN r13_event_mult = 99.0 THEN 'EVENT MISS'
-         WHEN max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END >= 70 THEN 'CRITICAL'
-         WHEN max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END >= 40 THEN 'HIGH'
-         WHEN max_rule + CASE WHEN strong_signals > 1 THEN 10 ELSE 0 END >= 20 THEN 'WATCH'
+         WHEN r14_cancel_mult = 99.0 THEN 'CANCEL DATE MISS'
+         WHEN (CASE WHEN aff_po_type = 'stock' AND dock_eta > effective_promise
+                     AND aff_days_cover >= DATEDIFF(day, effective_promise, dock_eta) AND base_score > 50 THEN 50
+                    WHEN aff_po_type = 'stock' AND dock_eta > effective_promise
+                     AND aff_available <= 0 AND base_score < 70 THEN 70
+                    ELSE base_score END) >= 70 THEN 'CRITICAL'
+         WHEN (CASE WHEN aff_po_type = 'stock' AND dock_eta > effective_promise
+                     AND aff_days_cover >= DATEDIFF(day, effective_promise, dock_eta) AND base_score > 50 THEN 50
+                    ELSE base_score END) >= 40 THEN 'HIGH'
+         WHEN base_score >= 20 THEN 'WATCH'
          ELSE 'OK' END                                                                 AS risk_band,
-    CASE c.max_rule
-         WHEN r1_dwell          THEN 'post_discharge_dwell'
-         WHEN r2_rail_drift     THEN 'rail_drift'
-         WHEN r3_vessel_drift   THEN 'vessel_drift'
-         WHEN r4_silence        THEN 'silence'
-         WHEN r5_transship      THEN 'transship_connection'
-         WHEN r6_exfactory_move THEN 'exfactory_move'
-         WHEN r8_promise        THEN 'promise_breach'
-         WHEN r9_internal       THEN 'internal_breach'
-         WHEN r12_customs       THEN 'customs_hold'
+    CASE
+         WHEN c.max_rule = r1_dwell THEN 'post_discharge_dwell'
+         WHEN c.max_rule = r2_rail_drift THEN 'rail_drift'
+         WHEN c.max_rule = r3_vessel_drift THEN 'vessel_drift'
+         WHEN c.max_rule = r4_silence THEN 'silence'
+         WHEN c.max_rule = r5_transship THEN 'transship_connection'
+         WHEN c.max_rule = r6_exfactory_move THEN 'exfactory_move'
+         WHEN c.max_rule = r8_promise THEN 'promise_breach'
+         WHEN c.max_rule = r9_internal THEN 'internal_breach'
+         WHEN c.max_rule = r12_customs THEN 'customs_hold'
+         WHEN Status IS NULL    THEN 'untracked'
          ELSE 'no_forward_date' END                                                    AS primary_signal
-FROM combined c
+    ,
+    -- disposition: which decision is still open for this line
+    CASE WHEN PODUnloaded IS NULL AND IsRailing = 1 AND current_vessel_eta IS NOT NULL
+              AND DATEADD(hour,-72,current_vessel_eta) > GETDATE()
+              AND dock_eta > effective_promise
+              AND DATEADD(day,4,current_vessel_eta) > effective_promise          THEN 'NOTIFY_EARLY'   -- late by rail AND by truck: born late, call now
+         WHEN PODUnloaded IS NULL AND IsRailing = 1 AND current_vessel_eta IS NOT NULL
+              AND DATEADD(hour,-72,current_vessel_eta) > GETDATE()               THEN 'DIVERT_WINDOW'
+         WHEN PODUnloaded IS NULL                                                THEN 'PRE_DISCHARGE'
+         WHEN Status IN ('Out for Delivery','At Rail Terminal')                  THEN 'ARRIVING'
+         ELSE 'NOTIFY' END                                                       AS disposition,
+    CASE WHEN PODUnloaded IS NULL AND current_vessel_eta IS NOT NULL
+         THEN DATEDIFF(hour, GETDATE(), DATEADD(hour,-72,current_vessel_eta)) END AS hours_to_divert_deadline,
+    -- would truck save this line? late by rail projection, on time by truck (vessel ETA + 4)
+    CASE WHEN PODUnloaded IS NULL AND IsRailing = 1 AND effective_promise IS NOT NULL
+              AND dock_eta > effective_promise
+              AND DATEADD(day,4,current_vessel_eta) <= effective_promise           THEN 1 ELSE 0 END AS truck_saves_line,
+    -- container context so one line can be read against the box it rides on
+    ct.container_orders,
+    ct.container_units,
+    -- normalized plain-language reasons for the score, non-zero rules only
+    CONCAT(
+      CASE WHEN r1_dwell          > 0 THEN CONCAT('dwelling ', days_since_discharge, 'd at ', COALESCE(Location,FirstUSPort), '; ') ELSE '' END,
+      CASE WHEN r2_rail_drift     > 0 THEN CONCAT('rail ETA slipped ', rail_eta_drift, 'd; ') ELSE '' END,
+      CASE WHEN r3_vessel_drift   > 0 THEN CONCAT('vessel ETA slipped ', vessel_eta_drift, 'd; ') ELSE '' END,
+      CASE WHEN r4_silence        > 0 THEN CONCAT('not seen in feed for ', days_since_seen, 'd; ') ELSE '' END,
+      CASE WHEN r5_transship      > 0 THEN 'missed transship connection; ' ELSE '' END,
+      CASE WHEN r6_exfactory_move > 0 THEN CONCAT('ex-factory moved ', moved_days, 'd later with ', lead_at_move, 'd lead; ') ELSE '' END,
+      CASE WHEN r8_promise        > 0 AND dock_eta > effective_promise AND aff_po_type = 'stock'
+                THEN CONCAT(DATEDIFF(day,effective_promise,dock_eta), 'd past ', affiliate, ' required date; ',
+                            CASE WHEN aff_available <= 0 THEN CONCAT(affiliate, ' OUT OF STOCK; ')
+                                 WHEN aff_days_cover IS NOT NULL THEN CONCAT(affiliate, ' has ', CAST(aff_days_cover AS int), 'd cover; ')
+                                 ELSE CONCAT(affiliate, ' has ', CAST(aff_available AS int), ' available, no recent sales; ') END)
+           WHEN r8_promise        > 0 AND dock_eta > effective_promise THEN CONCAT(DATEDIFF(day,effective_promise,dock_eta), 'd past customer promise; ')
+           WHEN r8_promise        > 0 THEN CONCAT('only ', DATEDIFF(day,dock_eta,effective_promise), 'd buffer to promise; ') ELSE '' END,
+      CASE WHEN r9_internal       > 0 THEN CONCAT(DATEDIFF(day,COALESCE(SO_RevisedDelivery,SO_OriginalDelivery),dock_eta), 'd past internal plan; ') ELSE '' END,
+      CASE WHEN r10_no_date       > 0 AND Status IS NULL THEN 'not tracked in Gnosis; '
+           WHEN r10_no_date       > 0 THEN 'no warehouse ETA; ' ELSE '' END,
+      CASE WHEN r12_customs       > 0 THEN CONCAT('no customs clearance ', DATEDIFF(day,PODUnloaded,GETDATE()), 'd after discharge; ') ELSE '' END,
+      CASE WHEN r13_event_mult = 99.0 THEN 'EVENT DATE MISSED; '
+           WHEN r13_event_mult > 1.0 THEN 'event date inside 7d; ' ELSE '' END,
+      CASE WHEN r14_cancel_mult = 99.0 THEN CONCAT(affiliate, ' CANCEL DATE MISSED by ', DATEDIFF(day,aff_cancel_date,dock_eta), 'd; ')
+           WHEN r14_cancel_mult > 1.0 THEN CONCAT(affiliate, ' cancel date inside 7d; ') ELSE '' END
+    )                                                                             AS reasons
+FROM scored0 c
+LEFT JOIN cont ct ON ct.Container_Number = c.Container_Number
 ) x;
-IF @Output = 'Scored' BEGIN SELECT * FROM #Scored ORDER BY risk_score DESC; RETURN; END
+-- ============================================================================
+-- PARCEL (UPS / FedEx). Carrier delivery date is the meaningful one. 
+-- For drop ship orders - the carrier delivery is to the customer's door. If it ships to DRI: + 2d cross-dock and transit.
+-- ============================================================================
+DROP TABLE IF EXISTS #ParcelRaw, #Parcel, #ParcelScored;
+
+SELECT * INTO #ParcelRaw FROM (
+    SELECT 'UPS' AS carrier, TrackingNumber AS tracking_no,
+           CASE Status WHEN 'Delivered' THEN 'DELIVERED' WHEN 'In Transit' THEN 'IN_TRANSIT' WHEN 'Manifest' THEN 'LABEL'
+                       WHEN 'Out for Delivery' THEN 'OUT_FOR_DELIVERY' WHEN 'Void' THEN 'VOID' WHEN 'Exception' THEN 'EXCEPTION' ELSE 'OTHER' END AS status_norm,
+           TRY_CAST(ManifestDate AS date) AS ship_date,
+           COALESCE(NULLIF(TRY_CAST(ScheduledDelivery AS date),'1900-01-01'), DATEADD(day,5,TRY_CAST(ManifestDate AS date))) AS scheduled_delivery,
+           CASE WHEN NULLIF(TRY_CAST(ScheduledDelivery AS date),'1900-01-01') IS NOT NULL THEN 'carrier' ELSE 'estimate' END AS scheduled_source,
+           CAST(NULL AS date) AS delivered_date,
+           ShipTo AS ship_to, CASE WHEN ShipTo LIKE '%DRI%' OR ShipTo LIKE '%EDWARDSVILLE%' THEN 0 ELSE 1 END AS is_drop_ship,
+           NULLIF(ExceptionDescription,'') AS exception_text,
+           CASE WHEN ExceptionDescription LIKE '%MECHANICAL%' OR ExceptionDescription LIKE '%WEATHER%' OR ExceptionDescription LIKE '%LATE FLIGHT%'
+                  OR ExceptionDescription LIKE '%TRANSIT DELAY%' OR ExceptionDescription LIKE '%RECALCULATED%' OR ExceptionDescription LIKE '%UPDATING PLANS%' THEN 'DELAY'
+                WHEN ExceptionDescription LIKE '%CLEARANCE%' OR ExceptionDescription LIKE '%CUSTOMS%' OR ExceptionDescription LIKE '%BROKER%' THEN 'CUSTOMS'
+                WHEN NULLIF(ExceptionDescription,'') IS NULL OR ExceptionDescription LIKE '%C.O.D.%' THEN 'NONE'
+                ELSE 'OTHER' END AS exception_class,
+           ORDR_DocNumCSV AS so_csv, DateAdded
+    FROM   TCWorking.dbo.UPS_DailyTracking_RawData
+    UNION ALL
+    SELECT 'FedEx', TrackingNumber,
+           CASE Status WHEN 'Delivered' THEN 'DELIVERED' WHEN 'Label created' THEN 'LABEL' WHEN 'On the way' THEN 'IN_TRANSIT'
+                       WHEN 'Out for delivery' THEN 'OUT_FOR_DELIVERY' WHEN 'Delivery updated' THEN 'IN_TRANSIT' WHEN 'Cancelled' THEN 'VOID'
+                       WHEN 'Clearance Delay' THEN 'EXCEPTION' WHEN 'We have your package' THEN 'IN_TRANSIT' ELSE 'OTHER' END,
+           TRY_CAST(ShippingDate AS date),
+           COALESCE(
+             TRY_CAST(ScheduledDeliveryDate AS date),
+             CASE WHEN TRY_CAST(ScheduledDeliveryDate AS int) BETWEEN 40000 AND 60000 THEN DATEADD(day, TRY_CAST(ScheduledDeliveryDate AS int) - 2, '1900-01-01') END,
+             TRY_CAST(StandardTransitDate AS date),
+             CASE WHEN TRY_CAST(StandardTransitDate AS int) BETWEEN 40000 AND 60000 THEN DATEADD(day, TRY_CAST(StandardTransitDate AS int) - 2, '1900-01-01') END,
+             DATEADD(day, 5, TRY_CAST(ShippingDate AS date))
+           ),
+           CASE WHEN TRY_CAST(ScheduledDeliveryDate AS date) IS NOT NULL OR TRY_CAST(ScheduledDeliveryDate AS int) BETWEEN 40000 AND 60000
+                  OR TRY_CAST(StandardTransitDate AS date) IS NOT NULL OR TRY_CAST(StandardTransitDate AS int) BETWEEN 40000 AND 60000
+                THEN 'carrier' ELSE 'estimate' END,
+           NULLIF(TRY_CAST(DeliveredDate AS date), '1900-01-01'),
+           RecipientCompany, CASE WHEN RecipientCompany LIKE '%DRI%' OR RecipientCity LIKE 'EDWARDSVILLE%' THEN 0 ELSE 1 END,
+           CASE WHEN Status = 'Clearance Delay' OR DelayStatus = 'DELAYED' THEN StatusWithDetails END,
+           CASE WHEN Status = 'Clearance Delay' THEN 'CUSTOMS' WHEN DelayStatus = 'DELAYED' THEN 'DELAY' ELSE 'NONE' END,
+           CAST(SAPSalesOrder AS nvarchar(50)), DateAdded
+    FROM   TCWorking.dbo.FedEx_DailyTracking_RawData
+) p;
+
+-- latest row per tracking number, baseline scheduled delivery from first row, status run
+WITH r AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY carrier, tracking_no ORDER BY DateAdded DESC) AS rn_last,
+              ROW_NUMBER() OVER (PARTITION BY carrier, tracking_no ORDER BY DateAdded ASC)  AS rn_first,
+              LAG(status_norm) OVER (PARTITION BY carrier, tracking_no ORDER BY DateAdded) AS prev_status
+    FROM #ParcelRaw
+), base AS (
+    SELECT carrier, tracking_no,
+           MIN(CASE WHEN scheduled_source = 'carrier' THEN scheduled_delivery END) AS first_scheduled,
+           MIN(CASE WHEN rn_first = 1 THEN DateAdded END)          AS first_seen,
+           MAX(DateAdded)                                          AS last_seen,
+           MAX(CASE WHEN prev_status IS NULL OR prev_status <> status_norm THEN DateAdded END) AS status_since
+    FROM r GROUP BY carrier, tracking_no
+)
+SELECT l.carrier, l.tracking_no, l.status_norm, l.ship_date, l.scheduled_delivery, l.scheduled_source, l.delivered_date,
+       l.ship_to, l.is_drop_ship, l.exception_text, l.exception_class, l.so_csv,
+       b.first_scheduled, b.first_seen, b.last_seen, b.status_since,
+       CASE WHEN l.scheduled_source = 'carrier' THEN DATEDIFF(day, b.first_scheduled, l.scheduled_delivery) END AS scheduled_drift,
+       DATEDIFF(day, b.status_since, GETDATE())               AS days_in_status
+INTO   #Parcel
+FROM   r l JOIN base b ON b.carrier = l.carrier AND b.tracking_no = l.tracking_no
+WHERE  l.rn_last = 1 AND l.status_norm NOT IN ('DELIVERED','VOID');
+
+-- explode SO csv, join order header, score
+WITH so AS (
+    SELECT p.*, TRY_CAST(TRIM(v.value) AS int) AS so_docnum
+    FROM   #Parcel p CROSS APPLY STRING_SPLIT(ISNULL(p.so_csv,''), ',') v
+    WHERE  TRY_CAST(TRIM(v.value) AS int) IS NOT NULL
+), j AS (
+    SELECT s.*, o.DocEntry AS ORDR_DocEntry, o.CardCode, o.CardName, o.OwnerCode,
+           CASE WHEN o.CardCode IN ('C00197','C00231','C00243','C00525','C005256') THEN 'BCS'
+                WHEN o.CardCode IN ('C00229') THEN 'DDT' ELSE 'CDN' END AS segment,
+           CONCAT(o.U_POPrefix,'-',o.NumAtCard) AS customer_po, o.U_Event, o.U_EventDt,
+           CASE WHEN own.email IS NULL OR own.lastName = 'Manager'
+                THEN (SELECT TOP 1 i.U_Merchandiser FROM DRI.dbo.RDR1 l JOIN DRI.dbo.OITM i ON i.ItemCode = l.ItemCode WHERE l.DocEntry = o.DocEntry ORDER BY l.LineNum)
+                ELSE own.email END AS route_to,
+           (SELECT MIN(U_QuotedDelivery) FROM DRI.dbo.RDR1 WHERE DocEntry = o.DocEntry) AS promise,
+           CASE WHEN s.is_drop_ship = 1 THEN s.scheduled_delivery ELSE DATEADD(day, 2, s.scheduled_delivery) END AS customer_eta
+    FROM   so s
+    JOIN   DRI.dbo.ORDR o ON o.DocNum = s.so_docnum AND o.DocStatus = 'O'
+    LEFT   JOIN DRI.dbo.OHEM own ON own.empID = o.OwnerCode
+    WHERE  @Segment = 'ALL' OR (CASE WHEN o.CardCode IN ('C00197','C00231','C00243','C00525','C005256') THEN 'BCS'
+                                     WHEN o.CardCode IN ('C00229') THEN 'DDT' ELSE 'CDN' END) = @Segment
+), rules AS (
+    SELECT j.*,
+        -- P1 late to promise. 40 + 10/day
+        CASE WHEN customer_eta > promise THEN (CASE WHEN 40 + DATEDIFF(day,promise,customer_eta)*10 > 100 THEN 100 ELSE 40 + DATEDIFF(day,promise,customer_eta)*10 END)
+             WHEN DATEDIFF(day, customer_eta, promise) <= 1 AND scheduled_source = 'estimate' THEN 25   -- no buffer, carrier has not committed
+             WHEN DATEDIFF(day, customer_eta, promise) <= 1 THEN 15
+             ELSE 0 END AS p1_late,
+        -- P2 past carrier's own scheduled date, not delivered
+        CASE WHEN scheduled_delivery < CAST(GETDATE() AS date) AND status_norm <> 'LABEL' THEN 85 ELSE 0 END AS p2_past_scheduled,
+        -- P3 exception
+        CASE exception_class WHEN 'CUSTOMS' THEN 75 WHEN 'DELAY' THEN 70 WHEN 'OTHER' THEN 50 ELSE 0 END AS p3_exception,
+        -- P4 scheduled delivery slipped
+        CASE WHEN scheduled_drift >= 1 THEN (CASE WHEN 35 + (scheduled_drift-1)*15 > 85 THEN 85 ELSE 35 + (scheduled_drift-1)*15 END) ELSE 0 END AS p4_drift,
+        -- P5 silence. 3+ daily pulls, same status, in transit
+        CASE WHEN status_norm IN ('IN_TRANSIT','OUT_FOR_DELIVERY') AND days_in_status >= 3 THEN 50 ELSE 0 END AS p5_silence,
+        -- P6 not moving. Label exists, no scan after 2d
+        CASE WHEN status_norm = 'LABEL' AND DATEDIFF(day, COALESCE(ship_date, first_seen), GETDATE()) >= 2 THEN 60 ELSE 0 END AS p6_not_moving,
+        CASE WHEN U_EventDt IS NULL OR customer_eta IS NULL THEN 1.0 WHEN customer_eta > U_EventDt THEN 99.0 WHEN DATEDIFF(day,customer_eta,U_EventDt) < 7 THEN 1.5 ELSE 1.0 END AS p13_event_mult
+    FROM j
+), c AS (
+    SELECT r.*,
+        (SELECT MAX(v) FROM (VALUES (p1_late),(p2_past_scheduled),(p3_exception),(p4_drift),(p5_silence),(p6_not_moving)) t(v)) AS max_rule,
+        (CASE WHEN p1_late>=40 THEN 1 ELSE 0 END + CASE WHEN p2_past_scheduled>=40 THEN 1 ELSE 0 END + CASE WHEN p3_exception>=40 THEN 1 ELSE 0 END
+         + CASE WHEN p4_drift>=40 THEN 1 ELSE 0 END + CASE WHEN p6_not_moving>=40 THEN 1 ELSE 0 END) AS strong_signals
+    FROM rules r
+)
+SELECT c.*,
+    CASE WHEN p13_event_mult = 99.0 THEN 100
+         ELSE (CASE WHEN CAST((max_rule + CASE WHEN strong_signals>1 THEN 10 ELSE 0 END) * p13_event_mult AS int) > 100 THEN 100
+                    ELSE CAST((max_rule + CASE WHEN strong_signals>1 THEN 10 ELSE 0 END) * p13_event_mult AS int) END) END AS risk_score,
+    CASE WHEN p13_event_mult = 99.0 THEN 'EVENT MISS'
+         WHEN max_rule + CASE WHEN strong_signals>1 THEN 10 ELSE 0 END >= 70 THEN 'CRITICAL'
+         WHEN max_rule + CASE WHEN strong_signals>1 THEN 10 ELSE 0 END >= 40 THEN 'HIGH'
+         WHEN max_rule + CASE WHEN strong_signals>1 THEN 10 ELSE 0 END >= 20 THEN 'WATCH' ELSE 'OK' END AS risk_band,
+    CASE WHEN max_rule = 0 THEN 'none'
+         WHEN max_rule = p2_past_scheduled THEN 'past_scheduled' WHEN max_rule = p3_exception THEN 'exception' WHEN max_rule = p1_late THEN 'late_to_promise'
+         WHEN max_rule = p6_not_moving THEN 'not_moving' WHEN max_rule = p4_drift THEN 'scheduled_drift' WHEN max_rule = p5_silence THEN 'silence' ELSE 'none' END AS primary_signal,
+    CASE WHEN exception_class <> 'NONE' THEN 'EXCEPTION'
+         WHEN scheduled_delivery < CAST(GETDATE() AS date) AND status_norm <> 'LABEL' THEN 'LATE_DELIVERY'
+         WHEN status_norm = 'LABEL' THEN 'NOT_SHIPPED'
+         WHEN customer_eta > promise THEN 'IN_TRANSIT_LATE'
+         WHEN DATEDIFF(day, customer_eta, promise) <= 1 THEN 'IN_TRANSIT_TIGHT'
+         ELSE 'ON_TIME' END AS disposition,
+    CONCAT(
+      CASE WHEN p2_past_scheduled > 0 THEN CONCAT('carrier scheduled ', FORMAT(scheduled_delivery,'M/d'), ', not delivered; ') ELSE '' END,
+      CASE WHEN p3_exception > 0 THEN CONCAT(exception_class, ': ', LEFT(exception_text,60), '; ') ELSE '' END,
+      CASE WHEN p1_late > 0 AND customer_eta > promise THEN CONCAT(DATEDIFF(day,promise,customer_eta), 'd past customer promise; ')
+           WHEN p1_late > 0 THEN CONCAT(DATEDIFF(day,customer_eta,promise), 'd buffer to promise', CASE WHEN scheduled_source = 'estimate' THEN ', carrier date not yet published; ' ELSE '; ' END) ELSE '' END,
+      CASE WHEN p6_not_moving > 0 THEN CONCAT('label created ', DATEDIFF(day, COALESCE(ship_date, first_seen), GETDATE()), 'd ago, not moving; ') ELSE '' END,
+      CASE WHEN p4_drift > 0 THEN CONCAT('scheduled delivery slipped ', scheduled_drift, 'd; ') ELSE '' END,
+      CASE WHEN p5_silence > 0 THEN CONCAT('no status change for ', days_in_status, 'd; ') ELSE '' END,
+      CASE WHEN p13_event_mult = 99.0 THEN 'EVENT DATE MISSED; ' WHEN p13_event_mult > 1.0 THEN 'event date inside 7d; ' ELSE '' END
+    ) AS reasons
+INTO   #ParcelScored
+FROM   c;
+
+IF @Output = 'Parcel' BEGIN SELECT * FROM #ParcelScored ORDER BY risk_score DESC, DATEDIFF(day,promise,customer_eta) DESC; RETURN; END
+
+IF @Output = 'Scored' BEGIN SELECT * FROM #Scored ORDER BY risk_score DESC, DATEDIFF(day, effective_promise, dock_eta) DESC, SO_Line_Qty DESC; RETURN; END
+
+-- 4b. DDT customer orders fed by a late container. One row per DDT SO line in whs 01.
+IF @Output = 'DDTOrders' BEGIN
+WITH d AS (
+    SELECT s.Container_Number, s.Status, s.Location, s.dock_eta, s.risk_score, s.risk_band, s.disposition, s.reasons,
+           s.ORDR_DocNum AS dri_so, s.RDR1_LineNum AS dri_line, s.RDR1_StyleNumber, s.SO_Line_Qty AS dri_line_qty,
+           s.aff_on_hand, s.aff_committed, s.aff_available, s.aff_po_open_qty,
+           o.DocNum AS ddt_so, o.CardCode AS ddt_cardcode, o.CardName AS ddt_customer, o.NumAtCard AS ddt_cust_po,
+           cs.email AS ddt_cs_email, cs.firstName + ' ' + cs.lastName AS ddt_cs_name,
+           l.LineNum AS ddt_line, l.ShipDate AS ddt_ship_date, l.OpenQty AS ddt_open_qty,
+           DATEADD(day, @DDTTransferDays, s.dock_eta) AS ddt_available_dt,
+           SUM(l.OpenQty) OVER (PARTITION BY s.ORDR_DocEntry, s.RDR1_LineNum ORDER BY l.ShipDate, o.DocDate, o.DocNum, l.LineNum ROWS UNBOUNDED PRECEDING) AS cum_open
+    FROM   #Scored s
+    JOIN   Driduck.dbo.RDR1 l ON l.ItemCode = s.RDR1_StyleNumber AND l.WhsCode = '01' AND l.LineStatus = 'O'
+    JOIN   Driduck.dbo.ORDR o ON o.DocEntry = l.DocEntry AND o.DocStatus = 'O' AND o.CANCELED = 'N'
+    LEFT   JOIN Driduck.dbo.OHEM cs ON cs.empID = o.OwnerCode
+    WHERE  s.segment = 'DDT' AND s.aff_available < 0
+)
+SELECT *,
+       CASE WHEN cum_open <= aff_on_hand THEN 'on_hand'
+            WHEN cum_open <= aff_on_hand + aff_po_open_qty THEN 'this_box'
+            ELSE 'short_after' END                                  AS bucket,
+       DATEDIFF(day, ddt_ship_date, ddt_available_dt)              AS days_late_to_ddt_customer
+FROM   d
+ORDER  BY CASE WHEN cum_open <= aff_on_hand + aff_po_open_qty AND cum_open > aff_on_hand THEN 0 ELSE 1 END,
+          DATEDIFF(day, ddt_ship_date, ddt_available_dt) DESC, risk_score DESC;
+RETURN; END
 
 -- 5. Divert queue
 IF @Output = 'Divert' BEGIN
@@ -368,7 +727,8 @@ WITH lines AS (
     s.U_POPrefix,
     s.NumAtCard,
     s.U_DivertDecision,
-    s.U_DivertDecisionETA
+    s.U_DivertDecisionETA,
+    s.segment
 FROM #Scored s
     WHERE  s.Mode = 'SEA'
       AND  s.IsRailing = 1
@@ -399,9 +759,12 @@ SELECT
     rail_eta,
     truck_eta,
     COUNT(DISTINCT ORDR_DocNum)                                                   AS orders_on_box,
+    COUNT(DISTINCT CASE WHEN segment = 'CDN' THEN ORDR_DocNum END)               AS cdn_orders,
+    COUNT(DISTINCT CASE WHEN segment = 'DDT' THEN ORDR_DocNum END)               AS ddt_orders,
+    COUNT(DISTINCT CASE WHEN segment = 'BCS' THEN ORDR_DocNum END)               AS bcs_orders,
     COUNT(DISTINCT CASE WHEN band = 'saved' THEN ORDR_DocNum END)                 AS orders_saved,
     SUM(CASE WHEN band = 'saved' THEN SO_Line_Qty ELSE 0 END)                     AS units_saved,
-    COUNT(DISTINCT CASE WHEN band = 'saved' AND U_Event = 'Y' THEN ORDR_DocNum END) AS event_orders_saved,
+    COUNT(DISTINCT CASE WHEN band = 'saved' AND U_Event IN ('Y','Yes') THEN ORDR_DocNum END) AS event_orders_saved,
     COUNT(DISTINCT CASE WHEN band = 'late_regardless' THEN ORDR_DocNum END)       AS orders_late_regardless,
     COUNT(DISTINCT CASE WHEN band = 'fine' THEN ORDR_DocNum END)                  AS orders_fine,
     MAX(CASE WHEN band = 'saved' THEN DATEDIFF(day, Line_Quoted_Delivery, rail_eta) END) AS worst_rail_miss_days,
@@ -418,11 +781,10 @@ RETURN; END
 -- 6. Merch queue and rollups
 SELECT * INTO #Merch FROM (
 SELECT
-    s.owner_email                                        AS merchandiser,
+    s.route_to                                           AS merchandiser,
     s.owner_name,
     s.item_merchandiser,
     s.ORDR_DocNum, s.RDR1_LineNum, s.RDR1_StyleNumber, s.SO_Line_Qty,
-    CONCAT(s.U_POPrefix, '-', s.NumAtCard)               AS customer_po,
     s.CardCode, s.CardName,
     s.Container_Number, s.Status, s.Location,
     s.Line_Quoted_Delivery                               AS quoted_delivery,
@@ -436,13 +798,13 @@ SELECT
     CASE WHEN s.cust_commit_dt IS NULL THEN 'OPEN' ELSE 'STALE' END AS notify_state
 FROM   #Scored s
 JOIN   DRI.dbo.ORDR o ON o.DocEntry = s.ORDR_DocEntry
-WHERE  s.PODUnloaded IS NOT NULL
+WHERE  (s.PODUnloaded IS NOT NULL OR s.disposition = 'NOTIFY_EARLY')
   AND  s.dock_eta IS NOT NULL
   AND  s.effective_promise IS NOT NULL
   AND  DATEDIFF(day, s.effective_promise, s.dock_eta) >= CASE WHEN s.cust_commit_dt IS NULL THEN 1 ELSE 2 END
 ) x;
 IF @Output = 'Merch' BEGIN
-    SELECT * FROM #Merch WHERE @OwnerEmail IS NULL OR merchandiser = @OwnerEmail ORDER BY risk_score DESC; RETURN; END
+    SELECT * FROM #Merch WHERE @OwnerEmail IS NULL OR merchandiser = @OwnerEmail ORDER BY risk_score DESC, days_past_promise DESC, SO_Line_Qty DESC; RETURN; END
 IF @Output = 'MerchRollup' BEGIN SELECT
     merchandiser,
     COUNT(DISTINCT ORDR_DocNum)                                              AS impacted_orders,
@@ -451,7 +813,7 @@ IF @Output = 'MerchRollup' BEGIN SELECT
     COUNT(DISTINCT CASE WHEN notify_state = 'OPEN'  THEN ORDR_DocNum END)             AS open_items,
     COUNT(DISTINCT CASE WHEN notify_state = 'STALE' THEN ORDR_DocNum END)             AS re_fired,
     COUNT(DISTINCT CASE WHEN expedite_flag IS NOT NULL THEN ORDR_DocNum END) AS expedite_flagged,
-    COUNT(DISTINCT CASE WHEN U_Event = 'Y' THEN ORDR_DocNum END)             AS event_orders,
+    COUNT(DISTINCT CASE WHEN U_Event IN ('Y','Yes') THEN ORDR_DocNum END)             AS event_orders,
     MAX(days_past_promise)                                                   AS worst_days_past,
     MAX(risk_score)                                                          AS worst_score
 FROM   #Merch
@@ -467,9 +829,3 @@ IF @Output = 'ContainerRollup' BEGIN SELECT
     MAX(risk_score)                                                          AS worst_score
 FROM   #Merch
 GROUP  BY Container_Number, Status, Location ORDER BY units DESC; RETURN; END
-END
-GO
-
--- EXEC dbo.usp_InboundRisk 'Divert'
--- EXEC dbo.usp_InboundRisk 'Merch', 'jdoe@capsdirect.com'
--- Power BI: Import mode, SQL statement = EXEC TCWorking.dbo.usp_InboundRisk 'Scored'
