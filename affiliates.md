@@ -44,9 +44,9 @@ One row per DDT customer sales order line in whs 01, for scored DDT lines with `
 | `ddt_open_qty` | Units still open on the DDT line. |
 | `ddt_available_dt` | `dock_eta` plus the DRI-to-DDT transfer allowance. When DDT can ship. |
 | `cum_open` | Running total of open units in ShipDate order. Allocation input. |
-| `bucket` | `on_hand` - stock covers it. `this_box` - this container fills it. `short_after` - short even after this container. |
+| `bucket` | `on_hand` - DDT stock already covers it, not at risk. `this_box` - this container fills it. `short_after` - short even after this container. |
 | `days_late_to_ddt_customer` | `ddt_available_dt` minus `ddt_ship_date`. Negative means on time. |
 
 ## DDT customers behind a stock PO
 
-Every DDT PO is stock, but a negative `aff_available` means DDT's open customer orders already exceed what it has. DDTOrders names those customers. Allocation is oldest ShipDate first: on-hand covers the earliest orders, this container covers the next, anything past that is `short_after`. Write about `this_box` rows as late DDT customer orders, by DDT customer and CS owner. Write about `short_after` in one line as a DDT purchasing gap. Never present the DRI PO date as the DDT promise when DDTOrders has rows - the promise is `ddt_ship_date`.
+Every DDT PO is stock, but a negative `aff_available` means DDT's open customer orders already exceed what it has. DDTOrders names those customers. Allocation is oldest ShipDate first: on-hand covers the earliest orders (`on_hand`, fine), this container covers the next (`this_box`), anything past that is `short_after`. `on_hand` rows are expected whenever DDT has any stock; their absence means the shelf is empty or the oldest order alone exceeds it. Write about `this_box` rows as late DDT customer orders, by DDT customer and CS owner. Write about `short_after` in one line as a DDT purchasing gap. Never present the DRI PO date as the DDT promise when DDTOrders has rows - the promise is `ddt_ship_date`.

@@ -29,7 +29,7 @@ Nine sections, this order, every time. Under 400 words unless more than 5 same-d
 6. **DDT customers waiting.** DDTOrders, `bucket = this_box` only. Per container, grouped by `ddt_cs_email`: distinct orders, sum of `ddt_open_qty`, worst `days_late_to_ddt_customer`, `ddt_customer` with `ddt_cust_po`. Sort by worst days late. One closing line with the `short_after` count. "None" if absent.
 7. **By merchandiser.** Critical orders and units per `route_to`, top 3.
 8. **Parcel.** Active packages not `ON_TIME`, grouped by order. See `references/parcel.md`.
-9. **Data notes.** `primary_signal = untracked`. Rules not firing. `on_hand` rows in DDTOrders. Data errors, not shipment problems.
+9. **Data notes.** `primary_signal = untracked`. Rules not firing. Data errors, not shipment problems.
 
 ## Rules
 
@@ -39,7 +39,7 @@ Nine sections, this order, every time. Under 400 words unless more than 5 same-d
 - A PO number from the user is a lookup key. Match it against `customer_po` in Scored and Parcel, ignoring case. If that misses, try `DRI_po` and then `ORDR_DocNum` or `so_docnum`. In DDTOrders, `ddt_customer` and `ddt_cust_po`, never `ddt_so` alone.
 - Late means `dock_eta > effective_promise`. A high score from dwell or drift is risk, not lateness.
 - Never recommend diverting a container where `truck_saves_line = 0` on every line. Move it to the customer-call section.
-- `bucket` decides whether a DDT customer is this container's problem. `this_box` - call them. `short_after` - short regardless; one line, DDT purchasing, not exposure. `on_hand` should not appear.
+- `bucket` decides whether a DDT customer is this container's problem. `this_box` - call them. `short_after` - short regardless; one line, DDT purchasing, not exposure. `on_hand` - DDT stock already covers it; not at risk, not reported.
 - `ddt_cs_email` owns the DDT customer call. `route_to` owns the DRI side. Never send a DRI merchandiser to call a DDT customer.
 - If `ddt_available_dt = dock_eta` the transfer allowance is zero. Say "at DRI dock."
 - For a DDT stock line, `effective_promise` is the earliest `ddt_ship_date` this box feeds, not the DDT PO date. A late DDT line means a named DDT customer is late.
